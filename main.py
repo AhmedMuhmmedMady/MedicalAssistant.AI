@@ -11,69 +11,86 @@ from pinecone import Pinecone
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
+
 # ─────────────────────────────────────────────
-# Config (set these as Railway environment variables)
+# Config (Railway Environment Variables only)
 # ─────────────────────────────────────────────
-PINECONE_API_KEY  = os.getenv("PINECONE_API_KEY",  "pcsk_3Bxu6E_HjF5cNUBvb5aQJ3qYmBmcGtfinhJuc1Gd1Kj5oJcxdQR4FtJjjJHFcMvzwxtPow")
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY",    "AIzaSyANo6d9z_nu_fHOccstqyDvSTbSrRxCZbo")
-INDEX_NAME        = os.getenv("PINECONE_INDEX",    "medical-index")
-MODEL_NAME        = os.getenv("EMBED_MODEL",       "paraphrase-multilingual-MiniLM-L12-v2")
-TOP_K             = int(os.getenv("TOP_K",         "3"))
-MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.3"))
-PORT              = int(os.getenv("PORT",          "8000"))
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+INDEX_NAME       = os.getenv("PINECONE_INDEX", "medical-index")
+MODEL_NAME       = os.getenv("EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+TOP_K            = int(os.getenv("TOP_K", "3"))
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.3"))
+PORT             = int(os.getenv("PORT", "8000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+
 # ─────────────────────────────────────────────
-# Global singletons
+# Globals
 # ─────────────────────────────────────────────
+
 embed_model: Optional[SentenceTransformer] = None
 pinecone_index = None
 gemini_model = None
 
 
+# ─────────────────────────────────────────────
+# Lifespan
+# ─────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global embed_model, pinecone_index, gemini_model
 
-    log.info("Loading embedding model…")
-    embed_model = SentenceTransformer(MODEL_NAME)
-    log.info("Embedding model loaded.")
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY is missing in environment variables")
 
-    log.info("Connecting to Pinecone…")
+    if not PINECONE_API_KEY:
+        raise Exception("PINECONE_API_KEY is missing in environment variables")
+
+    log.info("Loading embedding model...")
+    embed_model = SentenceTransformer(MODEL_NAME)
+
+    log.info("Connecting to Pinecone...")
     pc = Pinecone(api_key=PINECONE_API_KEY)
     pinecone_index = pc.Index(INDEX_NAME)
-    log.info("Pinecone connected.")
 
-    log.info("Configuring Gemini…")
+    log.info("Configuring Gemini...")
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-    log.info("Gemini ready.")
 
-    yield  # app runs here
+    log.info("All services initialized successfully.")
 
-    log.info("Shutting down…")
+    yield
 
+    log.info("Shutting down...")
+
+
+# ─────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────
 
 app = FastAPI(
     title="Medical AI Service",
-    description="Pinecone semantic search + Gemini response generation",
     version="2.0.0",
-    lifespan=lifespan,
+    lifespan=lifespan
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
 # ─────────────────────────────────────────────
 # Schemas
 # ─────────────────────────────────────────────
+
 class AskRequest(BaseModel):
     text: str
 
@@ -95,9 +112,14 @@ class AskResponse(BaseModel):
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
+
 def search_pinecone(query: str) -> List[MatchResult]:
     vector = embed_model.encode(query).tolist()
-    result = pinecone_index.query(vector=vector, top_k=TOP_K, include_metadata=True)
+    result = pinecone_index.query(
+        vector=vector,
+        top_k=TOP_K,
+        include_metadata=True
+    )
 
     matches = []
     for m in result.matches:
@@ -106,77 +128,83 @@ def search_pinecone(query: str) -> List[MatchResult]:
             symptom=meta.get("symptom", ""),
             reply=meta.get("reply", ""),
             category=meta.get("category", ""),
-            confidence=round(float(m.score), 4),
+            confidence=round(float(m.score), 4)
         ))
+
     return matches
 
 
 def build_gemini_prompt(query: str, matches: List[MatchResult]) -> str:
-    context_parts = []
-    for i, m in enumerate(matches, 1):
-        context_parts.append(
-            f"[Source {i}]\n"
-            f"Category: {m.category}\n"
-            f"Symptom: {m.symptom}\n"
-            f"Medical Reply: {m.reply}\n"
-        )
-    context = "\n".join(context_parts)
+    context = "\n".join([
+        f"[Source {i+1}]\n"
+        f"Category: {m.category}\n"
+        f"Symptom: {m.symptom}\n"
+        f"Reply: {m.reply}\n"
+        for i, m in enumerate(matches)
+    ])
 
-    return (
-        "You are a helpful medical assistant. "
-        "Using ONLY the medical information provided below, answer the user's question clearly and concisely. "
-        "If the information is insufficient, say so politely. "
-        "Do NOT invent information. Always recommend consulting a doctor for serious concerns.\n\n"
-        f"--- Medical Context ---\n{context}\n"
-        f"--- User Question ---\n{query}\n\n"
-        "Answer:"
-    )
+    return f"""
+You are a medical assistant.
+Use ONLY the context below.
+
+Context:
+{context}
+
+User Question:
+{query}
+
+Answer clearly and safely.
+"""
 
 
 def ask_gemini(prompt: str) -> str:
-    for attempt in range(3):
-        try:
-            response = gemini_model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            log.warning(f"Gemini attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)
-    return "Sorry, the AI service is temporarily unavailable. Please try again later."
+    try:
+        response = gemini_model.generate_content(prompt)
+
+        if not response or not response.text:
+            raise ValueError("Empty response from Gemini")
+
+        return response.text.strip()
+
+    except Exception as e:
+        log.error(f"Gemini error: {str(e)}")
+        return f"Gemini failed: {str(e)}"
 
 
 # ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "index": INDEX_NAME}
+    return {"status": "ok"}
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=422, detail="Question text cannot be empty.")
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="Empty question")
 
     try:
-        matches = search_pinecone(req.text.strip())
+        matches = search_pinecone(req.text)
     except Exception as e:
         log.error(f"Pinecone error: {e}")
-        raise HTTPException(status_code=503, detail="Search service unavailable.")
+        raise HTTPException(status_code=503, detail="Pinecone unavailable")
 
     low_confidence = not matches or matches[0].confidence < MIN_CONFIDENCE
 
     if low_confidence:
         gemini_reply = (
-            "I couldn't find relevant medical information for your question in our database. "
-            "Please consult a qualified healthcare professional."
+            "I couldn't find strong matches in the medical database. "
+            "Please consult a doctor."
         )
     else:
-        prompt = build_gemini_prompt(req.text.strip(), matches)
+        prompt = build_gemini_prompt(req.text, matches)
         gemini_reply = ask_gemini(prompt)
 
     return AskResponse(
-        query=req.text.strip(),
+        query=req.text,
         gemini_reply=gemini_reply,
         matches=matches,
-        low_confidence=low_confidence,
+        low_confidence=low_confidence
     )
