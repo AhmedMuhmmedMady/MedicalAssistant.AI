@@ -2,7 +2,6 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="&#10;full AI Chat Service">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -93,7 +92,7 @@
       <updated>1778590505822</updated>
       <workItem from="1778590507349" duration="525000" />
       <workItem from="1778596986034" duration="6644000" />
-      <workItem from="1778610000960" duration="305000" />
+      <workItem from="1778610000960" duration="968000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -116,6 +115,17 @@
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="&#10;full AI Chat Service" />
