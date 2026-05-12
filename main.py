@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
-from google import genai
+import google.generativeai as genai
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -21,14 +21,14 @@ if not GEMINI_API_KEY:
 if not PINECONE_API_KEY:
     raise RuntimeError("Missing PINECONE_API_KEY environment variable")
 
+genai.configure(api_key=GEMINI_API_KEY)
+
 GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -115,18 +115,15 @@ def build_prompt(query: str, matches: List[MatchResult]) -> str:
 
 def ask_gemini(prompt: str) -> tuple[str, str]:
     last_error = None
-    for model in GEMINI_MODELS:
+    for model_name in GEMINI_MODELS:
         try:
-            log.info(f"Trying Gemini model: {model}")
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-            )
-            return response.text.strip(), model
+            log.info(f"Trying Gemini model: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text.strip(), model_name
         except Exception as e:
-            log.warning(f"Model {model} failed: {e}")
+            log.warning(f"Model {model_name} failed: {e}")
             last_error = e
-
     return f"All Gemini models failed. Last error: {last_error}", "none"
 
 
