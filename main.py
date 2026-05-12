@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
 
     log.info("Configuring Gemini...")
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-pro")
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
     log.info("All services initialized successfully.")
 
