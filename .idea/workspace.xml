@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="&#10;Update the AI Service To Process Images">
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-    </list>
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="&#10;Make the Response Support Arabic" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -97,7 +95,7 @@
       <workItem from="1778628771319" duration="480000" />
       <workItem from="1778631078630" duration="1547000" />
       <workItem from="1778661935003" duration="339000" />
-      <workItem from="1778662992737" duration="1695000" />
+      <workItem from="1778662992737" duration="3819000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -123,7 +121,23 @@
       <option name="project" value="LOCAL" />
       <updated>1778663940071</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="&#10;&#10;up the Response Message Length">
+      <option name="closed" value="true" />
+      <created>1778664905094</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1778664905094</updated>
+    </task>
+    <task id="LOCAL-00005" summary="&#10;Make the Response Support Arabic">
+      <option name="closed" value="true" />
+      <created>1778666061007</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1778666061007</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -146,10 +160,12 @@
     </ignored-roots>
     <MESSAGE value="&#10;full AI Chat Service" />
     <MESSAGE value="&#10;Update the AI Service To Process Images" />
-    <option name="LAST_COMMIT_MESSAGE" value="&#10;Update the AI Service To Process Images" />
+    <MESSAGE value="&#10;&#10;up the Response Message Length" />
+    <MESSAGE value="&#10;Make the Response Support Arabic" />
+    <option name="LAST_COMMIT_MESSAGE" value="&#10;Make the Response Support Arabic" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/MedicalAssistant_AI$main.coverage" NAME="main Coverage Results" MODIFIED="1778603392948" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778664784299" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778666023467" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
