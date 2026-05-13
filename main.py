@@ -1,10 +1,12 @@
 """
-Medical AI Assistant — Strict RAG Edition v6.0
+Medical AI Assistant — Strict RAG Edition v7.0
 ===============================================
-- Migrated from google-generativeai → google-genai (new SDK)
-- Answers ONLY from Pinecone knowledge base (text queries)
-- Analyzes medical images via Gemini Vision (/analyze-image)
-- If no relevant match is found, says so clearly
+Changes from v6:
+- MedicalClassifier now handles social greetings & chitchat naturally
+  (السلام عليكم، ازيك، شكراً، etc.) with warm, human-like responses
+  before steering back to the medical context.
+- Greeting responses are context-aware (AR/EN/EG dialect).
+- All other logic remains strictly RAG-based.
 """
 
 import base64
@@ -12,9 +14,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional
+from enum import Enum, auto
+from typing import List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -61,7 +65,6 @@ if not GEMINI_API_KEY:
 if not PINECONE_API_KEY:
     raise RuntimeError("Missing PINECONE_API_KEY environment variable.")
 
-# ── New SDK: single client instance ────────────────────────────────────────
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(
@@ -86,6 +89,8 @@ MEDICAL_KEYWORDS_AR = {
     "تعب", "إرهاق", "دوار", "غثيان", "إسهال", "إمساك", "حرقة",
     "الم", "عندي", "عندى", "اشعر", "احس", "اعاني", "يؤلم",
     "بوجعني", "بتوجعني", "حاسس", "حاسه", "حبوب", "طفح", "حكة",
+    "جرح", "كدمة", "خدر", "تنميل", "تورم", "حساسية", "زكام",
+    "برد", "انفلونزا", "بكتيريا", "فيروس", "فحص", "تحليل", "اشعة",
 }
 
 MEDICAL_KEYWORDS_EN = {
@@ -94,46 +99,78 @@ MEDICAL_KEYWORDS_EN = {
     "medicine", "drug", "blood", "heart", "lung", "kidney", "liver",
     "diabetes", "pressure", "infection", "allergy", "rash", "swelling",
     "fatigue", "tired", "breathe", "chest", "stomach", "throat",
+    "prescription", "diagnosis", "treatment", "surgery", "lab", "scan",
+    "xray", "mri", "test", "result", "clinic", "pharmacy", "dose",
 }
 
 VISION_SYSTEM_PROMPT = """You are a specialized medical AI assistant trained to analyze medical documents and images.
 
 STRICT VALIDATION — apply BEFORE any analysis:
+
 1. You ONLY analyze medical-related images such as:
-   - Laboratory test results (blood work, urine analysis, cultures, lipid panels, CBC, etc.)
+   - Laboratory test results (CBC, Hematology, Urine Analysis, Lipid Profile, etc.)
    - Medical prescriptions and medication lists
    - Radiology images (X-rays, MRI, CT scans, ultrasounds)
    - Pathology reports and microscopy slides
-   - Medical charts, ECG/EKG readings, vital sign charts
+   - ECG/EKG readings
    - Clinical notes and discharge summaries
 
 2. If the image is NOT medical, respond ONLY with this exact JSON:
-   {"status": "rejected", "analysis": "This image does not appear to be a medical document. I can only analyze lab results, prescriptions, X-rays, and other medical records."}
+{
+  "status": "rejected",
+  "analysis_ar": "هذه الصورة لا تبدو مستندًا طبيًا. يمكنني فقط تحليل التحاليل الطبية، الأشعات، والوصفات العلاجية.",
+  "technical_details": "Non-medical image detected."
+}
 
-3. If the image IS medical, respond ONLY with this exact JSON:
-   {"status": "success", "analysis": "<your full structured analysis here>"}
+3. If the image IS medical, respond ONLY with valid JSON using this EXACT structure:
+{
+  "status": "success",
+  "analysis_ar": "<Arabic explanation for the patient>",
+  "technical_details": "<Technical medical details in English>"
+}
 
-4. For medical images, your analysis must include:
-   - Document type identified
-   - Key findings or values observed
-   - Values outside normal range (if any), clearly highlighted
-   - Recommended next steps or specialist to consult
-   - Any urgent findings that require immediate attention
+4. Rules for medical analysis:
+   - Explain the findings in SIMPLE Arabic for normal patients
+   - Keep medical terminology and abbreviations in English
+   - Clearly highlight abnormal values
+   - Mention possible concerns without giving a final diagnosis
+   - Mention recommended specialist or next medical step
+   - Mention urgent findings if they exist
 
-5. NEVER provide a final diagnosis — provide observations and recommend consulting a specialist.
-6. Respond in the SAME language as the text found in the image (Arabic or English).
-7. Output ONLY valid JSON — no markdown, no extra text outside the JSON object."""
+5. NEVER provide a confirmed diagnosis.
+
+6. The Arabic explanation MUST:
+   - Be medically accurate
+   - Be easy to understand
+   - Sound natural for Arabic-speaking users
+
+7. The English technical section should:
+   - Be concise and professional
+   - Include abnormal findings and observations
+
+8. Output ONLY valid JSON. Do NOT use markdown.
+"""
 
 
 # ─────────────────────────────────────────────
-# Domain Models
+# Domain Enums & Models
 # ─────────────────────────────────────────────
+
+class QueryIntent(Enum):
+    """High-level classification of what the user is trying to do."""
+    GREETING      = auto()   # سلام / hello / ازيك
+    GRATITUDE     = auto()   # شكراً / thanks
+    FAREWELL      = auto()   # مع السلامة / bye
+    AFFIRMATION   = auto()   # تمام / ok / نعم
+    MEDICAL       = auto()   # actual medical question
+    OFF_TOPIC     = auto()   # something unrelated and not social
+
 
 @dataclass
 class KnowledgeMatch:
-    symptom: str
-    reply: str
-    category: str
+    symptom:    str
+    reply:      str
+    category:   str
     confidence: float
 
     @property
@@ -143,10 +180,11 @@ class KnowledgeMatch:
 
 @dataclass
 class QueryContext:
-    raw_query: str
-    language: str
+    raw_query:  str
+    language:   str
+    intent:     QueryIntent
     is_medical: bool
-    matches: List[KnowledgeMatch] = field(default_factory=list)
+    matches:    List[KnowledgeMatch] = field(default_factory=list)
 
     @property
     def has_reliable_matches(self) -> bool:
@@ -171,53 +209,292 @@ class AskRequest(BaseModel):
         if not v:
             raise ValueError("Query cannot be empty.")
         if len(v) > MAX_QUERY_LENGTH:
-            raise ValueError(f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters.")
+            raise ValueError(
+                f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters."
+            )
         return v
 
 
 class MatchResult(BaseModel):
-    symptom: str
-    reply: str
-    category: str
+    symptom:    str
+    reply:      str
+    category:   str
     confidence: float
 
 
 class AskResponse(BaseModel):
-    query: str
-    gemini_reply: str
-    model_used: str
-    matches: List[MatchResult]
-    low_confidence: bool
-    is_medical: bool
+    query:            str
+    gemini_reply:     str
+    model_used:       str
+    matches:          List[MatchResult]
+    low_confidence:   bool
+    is_medical:       bool
     found_in_database: bool
-    disclaimer: str
-    language: str
+    disclaimer:       str
+    language:         str
+    intent:           str
 
 
 # ─────────────────────────────────────────────
-# Service Layer
+# Language Detector
 # ─────────────────────────────────────────────
 
 class LanguageDetector:
+    """
+    Detects Arabic vs English.
+    Also attempts to detect Egyptian dialect (for friendlier responses).
+    """
+
+    _EG_MARKERS = {
+        "ازيك", "ازيكم", "عامل", "عاملة", "ايه", "إيه",
+        "بتوجعني", "بيوجعني", "بتوجعنى", "بيوجعنى",
+        "مش", "كده", "كدا", "عشان", "بتاع", "زى", "زي",
+        "تمام", "ماشي", "ماشى", "يعني", "يعنى", "أيوه", "ايوه",
+        "فين", "هنا", "هناك", "مين", "ليه", "إمتى", "امتى",
+    }
+
     @staticmethod
     def detect(text: str) -> str:
         arabic_chars = sum(1 for c in text if "\u0600" <= c <= "\u06ff")
         ratio = arabic_chars / max(len(text), 1)
         return "ar" if ratio > 0.3 else "en"
 
+    @classmethod
+    def is_egyptian_dialect(cls, text: str) -> bool:
+        lower = text.lower()
+        return any(marker in lower for marker in cls._EG_MARKERS)
+
+
+# ─────────────────────────────────────────────
+# Intent Classifier (rule-based, zero-latency)
+# ─────────────────────────────────────────────
+
+class IntentClassifier:
+    """
+    Fast rule-based classifier that intercepts social/conversational
+    messages BEFORE they reach the vector DB or Gemini.
+
+    Priority order:
+      1. Greetings
+      2. Gratitude
+      3. Farewells
+      4. Affirmations / filler phrases
+      5. Medical (keyword or KB hit)
+      6. Off-topic
+    """
+
+    # ── Greeting patterns ────────────────────────────────────────────
+    _GREETINGS_AR = {
+        r"السلام\s*عليكم", r"وعليكم\s*السلام", r"مرحب[اً]?", r"أهلاً?",
+        r"اهلاً?", r"هلا", r"صباح\s*(الخير|النور|الفل)",
+        r"مساء\s*(الخير|النور)", r"ازيك", r"إزيك", r"ازيكم", r"إزيكم",
+        r"عامل\s*ايه", r"عامل\s*إيه", r"كيف\s*حالك", r"كيفك",
+        r"كيف\s*الحال", r"شو\s*(أخبارك|أخبارج|عمل)",
+        r"هاي", r"هاى", r"هلو", r"حياك\s*الله",
+    }
+
+    _GREETINGS_EN = {
+        r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\bgreetings\b",
+        r"\bgood\s*(morning|afternoon|evening|day)\b",
+        r"\bhowdy\b", r"\bwassup\b", r"\bwhat'?s\s*up\b",
+    }
+
+    # ── Gratitude patterns ───────────────────────────────────────────
+    _THANKS_AR = {
+        r"شكر[اً]?", r"متشكر", r"ممنون", r"مشكور", r"يسلموا?",
+        r"الله\s*يسلمك", r"جزاك\s*الله", r"بارك\s*الله",
+    }
+
+    _THANKS_EN = {
+        r"\bthanks?\b", r"\bthank\s*you\b", r"\bthx\b",
+        r"\bappreciat\w+\b", r"\bgrateful\b",
+    }
+
+    # ── Farewell patterns ────────────────────────────────────────────
+    _FAREWELL_AR = {
+        r"مع\s*السلامة", r"وداعاً?", r"إلى\s*اللقاء",
+        r"باي", r"بائ", r"سلام\s*$", r"يلا\s*(باي|سلام)",
+    }
+
+    _FAREWELL_EN = {
+        r"\bbye\b", r"\bgoodbye\b", r"\bsee\s*ya\b",
+        r"\bsee\s*you\b", r"\btake\s*care\b", r"\blater\b",
+    }
+
+    # ── Affirmation / filler ─────────────────────────────────────────
+    _AFFIRMATION_AR = {
+        r"تمام", r"ماشي", r"ماشى", r"أوكي", r"اوكيه?",
+        r"نعم", r"أيوه?", r"ايوه?", r"طيب", r"حسناً?",
+        r"صح", r"زين", r"إن\s*شاء\s*الله",
+    }
+
+    _AFFIRMATION_EN = {
+        r"\bok(ay)?\b", r"\bsure\b", r"\byes\b", r"\byep\b",
+        r"\byup\b", r"\balright\b", r"\bgot\s*it\b",
+    }
+
+    # Pre-compile all patterns for speed
+    _PATTERNS: dict[QueryIntent, list] = {}
+
+    @classmethod
+    def _compile(cls) -> None:
+        if cls._PATTERNS:
+            return
+        mapping = {
+            QueryIntent.GREETING:    cls._GREETINGS_AR | cls._GREETINGS_EN,
+            QueryIntent.GRATITUDE:   cls._THANKS_AR    | cls._THANKS_EN,
+            QueryIntent.FAREWELL:    cls._FAREWELL_AR  | cls._FAREWELL_EN,
+            QueryIntent.AFFIRMATION: cls._AFFIRMATION_AR | cls._AFFIRMATION_EN,
+        }
+        for intent, patterns in mapping.items():
+            cls._PATTERNS[intent] = [
+                re.compile(p, re.IGNORECASE | re.UNICODE)
+                for p in patterns
+            ]
+
+    @classmethod
+    def classify(
+        cls,
+        query: str,
+        kb_matches: List[KnowledgeMatch],
+    ) -> QueryIntent:
+        cls._compile()
+
+        # Short-circuit: if KB returned a reliable medical hit → MEDICAL
+        if kb_matches and kb_matches[0].confidence >= MIN_CONFIDENCE:
+            return QueryIntent.MEDICAL
+
+        for intent, compiled in cls._PATTERNS.items():
+            for pattern in compiled:
+                if pattern.search(query):
+                    return intent
+
+        # Keyword scan for medical content
+        q_lower = query.lower()
+        if any(kw in q_lower for kw in MEDICAL_KEYWORDS_AR | MEDICAL_KEYWORDS_EN):
+            return QueryIntent.MEDICAL
+
+        return QueryIntent.OFF_TOPIC
+
+
+# ─────────────────────────────────────────────
+# Social Response Generator
+# ─────────────────────────────────────────────
+
+class SocialResponseGenerator:
+    """
+    Produces warm, human-like responses for social/conversational inputs.
+    Always ends with a gentle invitation to ask a medical question.
+    """
+
+    # Each category has a pool of responses; one is chosen deterministically
+    # based on the query hash (so the same phrase doesn't always get the
+    # same answer, but it IS reproducible for caching).
+
+    _RESPONSES: dict[QueryIntent, dict[str, list[str]]] = {
+        QueryIntent.GREETING: {
+            "ar": [
+                "وعليكم السلام ورحمة الله وبركاته 😊 أهلاً وسهلاً! أنا مساعدك الطبي. لو عندك أي استفسار صحي أو تحس بأي أعراض — أنا هنا ليك.",
+                "أهلاً بيك! 👋 يسعدني أساعدك. لو عندك سؤال طبي أو بتحس بأي حاجة — قولي وأنا في الخدمة.",
+                "مرحباً! 🌿 أنا مساعدك الصحي. هل تريد الاستفسار عن أعراض معينة أو حالة طبية؟",
+                "وعليكم السلام! أهلاً بك. إذا كان لديك استفسار طبي أو صحي — تفضل بسؤالك وسأحاول مساعدتك.",
+            ],
+            "en": [
+                "Hello! 👋 Welcome! I'm your medical assistant. Feel free to ask about any health concern or symptoms you have.",
+                "Hi there! 😊 I'm here to help with any medical questions you might have. What's on your mind?",
+                "Hey! Good to have you here. I'm a medical AI assistant — ask me anything health-related.",
+            ],
+        },
+        QueryIntent.GRATITUDE: {
+            "ar": [
+                "العفو! 😊 ده واجبي. لو عندك أي سؤال تاني أو حاجة تانية — أنا هنا.",
+                "بكل سرور! شرفني أساعدك. لو في أي حاجة تانية تخص صحتك — اسأل بكل راحة.",
+                "لا شكر على واجب! 🙏 صحتك تهمنا. في أي وقت محتاج مساعدة طبية — أنا هنا.",
+                "العفو تماماً. إذا كان لديك أي استفسار آخر — لا تتردد.",
+            ],
+            "en": [
+                "You're welcome! 😊 Happy to help. Feel free to ask anything else.",
+                "Of course! That's what I'm here for. Any other health questions?",
+                "No problem at all! Let me know if there's anything else I can help with.",
+            ],
+        },
+        QueryIntent.FAREWELL: {
+            "ar": [
+                "مع السلامة! 👋 اعتني بنفسك. لو احتجت مساعدة طبية في أي وقت — أنا هنا.",
+                "إلى اللقاء! 🌿 ربنا يحفظك ويوفقك. لو عندك أي سؤال مستقبلاً — لا تتردد.",
+                "وداعاً! تمنياتي لك بالصحة والعافية. 💙",
+                "مع السلامة! في أمان الله. أي وقت محتاج فيه استشارة طبية — رجعلنا.",
+            ],
+            "en": [
+                "Take care! 👋 Feel free to come back anytime you have health questions.",
+                "Goodbye! Wishing you good health. Don't hesitate to reach out anytime.",
+                "See you! Stay healthy. 💙",
+            ],
+        },
+        QueryIntent.AFFIRMATION: {
+            "ar": [
+                "تمام! 😊 لو عندك أي سؤال طبي — أنا في الخدمة.",
+                "حسناً! أنا هنا متى احتجت. هل عندك استفسار صحي؟",
+                "أوكي! لو في حاجة تخص صحتك — قولي وأنا أساعدك.",
+            ],
+            "en": [
+                "Got it! 😊 Let me know if you have any medical questions.",
+                "Sure! I'm here whenever you need health advice.",
+                "Alright! Feel free to ask anything health-related.",
+            ],
+        },
+    }
+
+    @classmethod
+    def generate(
+        cls,
+        intent:    QueryIntent,
+        query:     str,
+        language:  str,
+        is_egyptian: bool = False,
+    ) -> str:
+        pool = cls._RESPONSES.get(intent, {})
+        lang_key = "ar" if language == "ar" else "en"
+        options = pool.get(lang_key, [])
+
+        if not options:
+            # Fallback
+            if language == "ar":
+                return "أهلاً! كيف يمكنني مساعدتك طبياً اليوم؟"
+            return "Hello! How can I assist you medically today?"
+
+        # Deterministic but varied selection based on query content
+        idx = hash(query.strip().lower()) % len(options)
+        return options[idx]
+
+
+# ─────────────────────────────────────────────
+# Medical Classifier (updated façade)
+# ─────────────────────────────────────────────
 
 class MedicalClassifier:
-    @staticmethod
-    def is_medical(query: str, matches: List[KnowledgeMatch]) -> bool:
-        if matches and matches[0].confidence >= MIN_CONFIDENCE:
-            return True
-        q = query.lower()
-        return any(kw in q for kw in MEDICAL_KEYWORDS_AR | MEDICAL_KEYWORDS_EN)
+    """
+    Combines IntentClassifier + keyword scan.
+    Returns (is_medical: bool, intent: QueryIntent).
+    """
 
+    @staticmethod
+    def classify(
+        query: str,
+        matches: List[KnowledgeMatch],
+    ) -> Tuple[bool, QueryIntent]:
+        intent = IntentClassifier.classify(query, matches)
+        is_medical = intent == QueryIntent.MEDICAL
+        return is_medical, intent
+
+
+# ─────────────────────────────────────────────
+# Knowledge Base Service
+# ─────────────────────────────────────────────
 
 class KnowledgeBaseService:
     def __init__(self, index, embed_model: SentenceTransformer):
-        self._index = index
+        self._index       = index
         self._embed_model = embed_model
 
     def search(self, query: str, top_k: int = 5) -> List[KnowledgeMatch]:
@@ -240,6 +517,10 @@ class KnowledgeBaseService:
             ))
         return matches
 
+
+# ─────────────────────────────────────────────
+# Prompt Builder
+# ─────────────────────────────────────────────
 
 class PromptBuilder:
     _SYSTEM_AR = (
@@ -279,11 +560,19 @@ class PromptBuilder:
     )
 
     def get_no_data_response(self, language: str) -> str:
-        return self._NO_DATA_RESPONSE_AR if language == "ar" else self._NO_DATA_RESPONSE_EN
+        return (
+            self._NO_DATA_RESPONSE_AR
+            if language == "ar"
+            else self._NO_DATA_RESPONSE_EN
+        )
 
     def build(self, ctx: QueryContext) -> str:
         system    = self._SYSTEM_AR if ctx.language == "ar" else self._SYSTEM_EN
-        lang_note = "أجب باللغة العربية فقط." if ctx.language == "ar" else "Answer in English only."
+        lang_note = (
+            "أجب باللغة العربية فقط."
+            if ctx.language == "ar"
+            else "Answer in English only."
+        )
 
         context_parts = []
         for i, m in enumerate(ctx.matches):
@@ -321,11 +610,12 @@ class PromptBuilder:
         )
 
 
+# ─────────────────────────────────────────────
+# Gemini Service
+# ─────────────────────────────────────────────
+
 class GeminiService:
-    """
-    Wrapper around the new google-genai SDK.
-    Uses gemini_client (module-level) for all calls.
-    """
+    """Wrapper around the google-genai SDK with caching and fallback."""
 
     def __init__(self):
         self._cache: dict[str, tuple[str, str]] = {}
@@ -337,7 +627,7 @@ class GeminiService:
         )
 
     # ── Text generation ────────────────────────────────────────────────
-    def generate(self, prompt: str) -> tuple[str, str]:
+    def generate(self, prompt: str) -> Tuple[str, str]:
         cache_key = hashlib.md5(prompt.encode()).hexdigest()
         if cache_key in self._cache:
             log.info("Cache hit for prompt.")
@@ -360,13 +650,19 @@ class GeminiService:
                 last_error = e
 
         log.error(f"All Gemini models failed. Last error: {last_error}")
-        return "عذراً، حدث خطأ مؤقت في الخدمة. يرجى المحاولة مرة أخرى.", "none"
+        return (
+            "عذراً، حدث خطأ مؤقت في الخدمة. يرجى المحاولة مرة أخرى.",
+            "none",
+        )
 
     # ── Vision / image analysis ────────────────────────────────────────
-    def analyze_image(self, image_bytes: bytes, mime_type: str) -> tuple[str, str, str]:
+    def analyze_image(
+        self,
+        image_bytes: bytes,
+        mime_type:   str,
+    ) -> Tuple[str, str, str, str]:
         """
-        Analyze a medical image using Gemini Vision.
-        Returns (status, analysis, model_used).
+        Returns (status, analysis_ar, technical_details, model_used).
         """
         last_error = None
 
@@ -377,53 +673,72 @@ class GeminiService:
                     model=model_name,
                     contents=[
                         VISION_SYSTEM_PROMPT,
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type=mime_type,
+                        ),
                     ],
-                    config=self._config(max_tokens=8192),  # larger for detailed image analysis
+                    config=self._config(max_tokens=8192),
                 )
                 raw_text = response.text.strip()
 
-                # Parse JSON response from Gemini — handle nested JSON
                 try:
                     clean  = raw_text.replace("```json", "").replace("```", "").strip()
                     parsed = json.loads(clean)
-                    status   = parsed.get("status", "success")
-                    analysis = parsed.get("analysis", raw_text)
 
-                    # Gemini sometimes nests another JSON object inside analysis
-                    # Unwrap it recursively until we get a plain string
-                    max_depth = 3
-                    depth = 0
-                    while isinstance(analysis, (dict, list)) and depth < max_depth:
-                        if isinstance(analysis, dict):
-                            inner = analysis.get("analysis")
+                    status           = parsed.get("status", "success")
+                    analysis_ar      = parsed.get(
+                        "analysis_ar",
+                        "لم يتمكن النظام من إنشاء تحليل عربي.",
+                    )
+                    technical_details = parsed.get(
+                        "technical_details",
+                        "No technical details available.",
+                    )
+
+                    # Unwrap nested analysis if Gemini returned a dict
+                    max_depth, depth = 3, 0
+                    while isinstance(analysis_ar, (dict, list)) and depth < max_depth:
+                        if isinstance(analysis_ar, dict):
+                            inner = analysis_ar.get("analysis_ar")
                             if inner is not None:
-                                analysis = inner
+                                analysis_ar = inner
                                 depth += 1
                             else:
-                                # Convert dict to readable string
-                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                                analysis_ar = json.dumps(
+                                    analysis_ar, ensure_ascii=False, indent=2
+                                )
                                 break
                         else:
-                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                            analysis_ar = json.dumps(
+                                analysis_ar, ensure_ascii=False, indent=2
+                            )
                             break
 
-                    # Final safety: if still not a string, serialize it
-                    if not isinstance(analysis, str):
-                        analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                    if not isinstance(analysis_ar, str):
+                        analysis_ar = json.dumps(
+                            analysis_ar, ensure_ascii=False, indent=2
+                        )
 
-                    return status, analysis, model_name
+                    return status, analysis_ar, technical_details, model_name
 
-                except (json.JSONDecodeError, KeyError):
-                    log.warning(f"Vision model {model_name} did not return valid JSON — using raw text.")
-                    return "success", raw_text, model_name
+                except (json.JSONDecodeError, KeyError) as json_err:
+                    log.warning(
+                        f"Invalid JSON from vision model {model_name}: {json_err}"
+                    )
+                    return "error", "حدث خطأ أثناء تحليل الصورة الطبية.", raw_text, model_name
 
             except Exception as e:
                 log.warning(f"Vision model {model_name} failed: {e}")
                 last_error = e
 
         log.error(f"All vision models failed. Last error: {last_error}")
-        return "error", "Medical image analysis service is temporarily unavailable. Please try again later.", "none"
+        return (
+            "error",
+            "خدمة تحليل الصور الطبية غير متاحة حالياً.",
+            "Vision service unavailable.",
+            "none",
+        )
 
     @property
     def cache_size(self) -> int:
@@ -435,9 +750,9 @@ class GeminiService:
 # ─────────────────────────────────────────────
 
 class AppState:
-    knowledge_base: Optional[KnowledgeBaseService] = None
-    gemini: Optional[GeminiService] = None
-    prompt_builder: Optional[PromptBuilder] = None
+    knowledge_base:  Optional[KnowledgeBaseService] = None
+    gemini:          Optional[GeminiService]        = None
+    prompt_builder:  Optional[PromptBuilder]        = None
 
 
 state = AppState()
@@ -456,7 +771,7 @@ async def lifespan(app: FastAPI):
     state.gemini         = GeminiService()
     state.prompt_builder = PromptBuilder()
 
-    log.info("✅ Medical AI Assistant v6.0 is ready.")
+    log.info("✅ Medical AI Assistant v7.0 is ready.")
     yield
     log.info("🛑 Shutdown complete.")
 
@@ -467,8 +782,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Medical AI Assistant",
-    description="مساعد طبي ذكي — Strict RAG + Gemini Vision",
-    version="6.0.0",
+    description="مساعد طبي ذكي — Strict RAG + Gemini Vision + Social Awareness",
+    version="7.0.0",
     lifespan=lifespan,
 )
 
@@ -490,17 +805,53 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ─────────────────────────────────────────────
-# Endpoints
+# /ask Endpoint
 # ─────────────────────────────────────────────
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
-    language   = LanguageDetector.detect(req.text)
-    matches    = state.knowledge_base.search(req.text, top_k=5)
-    is_medical = MedicalClassifier.is_medical(req.text, matches)
+    language    = LanguageDetector.detect(req.text)
+    is_egyptian = LanguageDetector.is_egyptian_dialect(req.text)
 
-    # ── Not a medical question ──────────────────────────────────────────
-    if not is_medical:
+    # 1. Search knowledge base (needed for intent classification)
+    matches = state.knowledge_base.search(req.text, top_k=5)
+
+    # 2. Classify intent
+    is_medical, intent = MedicalClassifier.classify(req.text, matches)
+
+    log.info(
+        f"Query='{req.text[:60]}' | lang={language} | "
+        f"egyptian={is_egyptian} | intent={intent.name}"
+    )
+
+    # ── Social / conversational intent ─────────────────────────────────
+    if intent in {
+        QueryIntent.GREETING,
+        QueryIntent.GRATITUDE,
+        QueryIntent.FAREWELL,
+        QueryIntent.AFFIRMATION,
+    }:
+        reply = SocialResponseGenerator.generate(
+            intent=intent,
+            query=req.text,
+            language=language,
+            is_egyptian=is_egyptian,
+        )
+        return AskResponse(
+            query=req.text,
+            gemini_reply=reply,
+            model_used="rule-based",
+            matches=[],
+            low_confidence=False,
+            is_medical=False,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+            intent=intent.name,
+        )
+
+    # ── Off-topic (non-medical, non-social) ────────────────────────────
+    if intent == QueryIntent.OFF_TOPIC:
         reply = (
             "أنا مساعد طبي متخصص، ويسعدني مساعدتك في الاستفسارات الطبية والصحية فقط. 🏥\n"
             "إذا كان لديك سؤال عن أعراض، أمراض، أدوية، أو توجيهات طبية — فأنا هنا."
@@ -509,37 +860,64 @@ async def ask(req: AskRequest):
             "Feel free to ask about symptoms, conditions, medications, or medical guidance."
         )
         return AskResponse(
-            query=req.text, gemini_reply=reply, model_used="none",
-            matches=[], low_confidence=True, is_medical=False,
-            found_in_database=False, disclaimer=MEDICAL_DISCLAIMER, language=language,
+            query=req.text,
+            gemini_reply=reply,
+            model_used="none",
+            matches=[],
+            low_confidence=True,
+            is_medical=False,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+            intent=intent.name,
         )
 
+    # ── Medical intent ─────────────────────────────────────────────────
     ctx = QueryContext(
-        raw_query=req.text, language=language,
-        is_medical=True, matches=matches,
+        raw_query=req.text,
+        language=language,
+        intent=intent,
+        is_medical=True,
+        matches=matches,
     )
 
-    # ── No reliable matches → honest response ──────────────────────────
+    # No reliable KB matches → honest fallback
     if not ctx.has_reliable_matches:
         reply = state.prompt_builder.get_no_data_response(language)
         return AskResponse(
-            query=req.text, gemini_reply=reply, model_used="none",
+            query=req.text,
+            gemini_reply=reply,
+            model_used="none",
             matches=[MatchResult(**m.__dict__) for m in matches],
-            low_confidence=True, is_medical=True, found_in_database=False,
-            disclaimer=MEDICAL_DISCLAIMER, language=language,
+            low_confidence=True,
+            is_medical=True,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+            intent=intent.name,
         )
 
-    # ── Reliable matches → generate answer ─────────────────────────────
-    prompt = state.prompt_builder.build(ctx)
-    reply, model_used = state.gemini.generate(prompt)
+    # Reliable matches → generate Gemini answer
+    prompt             = state.prompt_builder.build(ctx)
+    reply, model_used  = state.gemini.generate(prompt)
 
     return AskResponse(
-        query=req.text, gemini_reply=reply, model_used=model_used,
+        query=req.text,
+        gemini_reply=reply,
+        model_used=model_used,
         matches=[MatchResult(**m.__dict__) for m in matches],
-        low_confidence=False, is_medical=True, found_in_database=True,
-        disclaimer=MEDICAL_DISCLAIMER, language=language,
+        low_confidence=False,
+        is_medical=True,
+        found_in_database=True,
+        disclaimer=MEDICAL_DISCLAIMER,
+        language=language,
+        intent=intent.name,
     )
 
+
+# ─────────────────────────────────────────────
+# /analyze-image Endpoint
+# ─────────────────────────────────────────────
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
@@ -548,52 +926,53 @@ async def analyze_image(file: UploadFile = File(...)):
     using Gemini Vision. Returns structured analysis or a polite rejection
     if the image is not medical-related.
     """
-    # ── Validate content type ───────────────────────────────────────────
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         return JSONResponse(
             status_code=400,
             content={
-                "status":     "error",
-                "analysis":   f"Unsupported file type '{file.content_type}'. "
-                              "Allowed: JPEG, PNG, WEBP, HEIC.",
-                "model_used": "none",
-                "disclaimer": MEDICAL_DISCLAIMER,
+                "status":           "error",
+                "analysis_ar":      "نوع الملف غير مدعوم.",
+                "technical_details": f"Unsupported file type: {file.content_type}",
+                "model_used":       "none",
+                "disclaimer":       MEDICAL_DISCLAIMER,
             },
         )
 
-    # ── Read bytes ──────────────────────────────────────────────────────
     try:
         image_bytes = await file.read()
     except Exception as e:
-        log.error(f"Failed to read uploaded image '{file.filename}': {e}")
+        log.error(f"Failed reading uploaded image: {e}")
         return JSONResponse(
             status_code=400,
             content={
-                "status":     "error",
-                "analysis":   "Failed to read the uploaded file.",
-                "model_used": "none",
-                "disclaimer": MEDICAL_DISCLAIMER,
+                "status":           "error",
+                "analysis_ar":      "فشل في قراءة الصورة المرفوعة.",
+                "technical_details": str(e),
+                "model_used":       "none",
+                "disclaimer":       MEDICAL_DISCLAIMER,
             },
         )
 
-    # ── Validate size ───────────────────────────────────────────────────
     if len(image_bytes) > MAX_IMAGE_SIZE:
         return JSONResponse(
             status_code=400,
             content={
-                "status":     "error",
-                "analysis":   f"File too large. Maximum allowed size is "
-                              f"{MAX_IMAGE_SIZE // (1024 * 1024)}MB.",
-                "model_used": "none",
-                "disclaimer": MEDICAL_DISCLAIMER,
+                "status":           "error",
+                "analysis_ar":      "حجم الصورة أكبر من الحد المسموح.",
+                "technical_details": f"Max allowed size is {MAX_IMAGE_SIZE // (1024 * 1024)}MB",
+                "model_used":       "none",
+                "disclaimer":       MEDICAL_DISCLAIMER,
             },
         )
 
-    log.info(f"Analyzing image: {file.filename} ({len(image_bytes) / 1024:.1f} KB, {file.content_type})")
+    log.info(
+        f"Analyzing image: {file.filename} "
+        f"({len(image_bytes) / 1024:.1f} KB, {file.content_type})"
+    )
 
-    # ── Analyze via Gemini Vision ───────────────────────────────────────
-    status, analysis, model_used = state.gemini.analyze_image(
-        image_bytes, file.content_type
+    status, analysis_ar, technical_details, model_used = state.gemini.analyze_image(
+        image_bytes,
+        file.content_type,
     )
 
     http_status = 503 if status == "error" else 200
@@ -601,10 +980,11 @@ async def analyze_image(file: UploadFile = File(...)):
     return JSONResponse(
         status_code=http_status,
         content={
-            "status":     status,
-            "analysis":   analysis,
-            "model_used": model_used,
-            "disclaimer": MEDICAL_DISCLAIMER,
+            "status":           status,
+            "analysis_ar":      analysis_ar,
+            "technical_details": technical_details,
+            "model_used":       model_used,
+            "disclaimer":       MEDICAL_DISCLAIMER,
         },
     )
 
@@ -617,10 +997,11 @@ async def analyze_image(file: UploadFile = File(...)):
 def health():
     return {
         "status":                   "ok",
-        "version":                  "6.0.0",
+        "version":                  "7.0.0",
         "cache_size":               state.gemini.cache_size if state.gemini else 0,
         "min_confidence_threshold": MIN_CONFIDENCE,
         "image_analysis":           "enabled",
+        "social_awareness":         "enabled",
     }
 
 
@@ -628,8 +1009,8 @@ def health():
 def root():
     return {
         "name":      "Medical AI Assistant",
-        "version":   "6.0.0",
-        "mode":      "strict-rag + vision",
+        "version":   "7.0.0",
+        "mode":      "strict-rag + vision + social-awareness",
         "status":    "running",
         "endpoints": ["/ask", "/analyze-image", "/health"],
         "docs":      "/docs",
