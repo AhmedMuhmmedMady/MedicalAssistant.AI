@@ -3,73 +3,65 @@ from __future__ import annotations
 import os
 import re
 import json
-import base64
-import hashlib
-import logging
 import asyncio
+import logging
+import hashlib
 from enum import Enum
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from google import genai
 from pinecone import Pinecone
 
 # ═════════════════ LOGGING ═════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("medical-ai")
 
-# ═════════════════ ENV ═════════════════
+# ═════════════════ SAFE ENV (NO CRASH) ═════════════════
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-INDEX_PRIMARY = os.getenv("PINECONE_INDEX_PRIMARY", "")
-INDEX_LEGACY = os.getenv("PINECONE_INDEX_LEGACY", "")
+def env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if not value:
+        log.warning(f"Missing env var: {name}")
+    return value
 
-TOP_K = int(os.getenv("TOP_K", "7"))
-MAX_DOCS = int(os.getenv("MAX_DOCS", "10"))
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.6"))
 
-if not all([GEMINI_API_KEY, PINECONE_API_KEY, INDEX_PRIMARY]):
-    raise ValueError("Missing env vars")
+GEMINI_API_KEY = env("GEMINI_API_KEY")
+PINECONE_API_KEY = env("PINECONE_API_KEY")
 
-# ═════════════════ CLIENTS ═════════════════
+# 🔥 FIX: match Railway variable name
+INDEX_PRIMARY = env("PINECONE_INDEX")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index_primary = pc.Index(INDEX_PRIMARY)
-index_legacy = pc.Index(INDEX_LEGACY) if INDEX_LEGACY else None
+# ═════════════════ CLIENTS (SAFE INIT) ═════════════════
 
-# ═════════════════ SIMPLE CACHE ═════════════════
+gemini_client = None
+pc = None
+index_primary = None
 
-EMBED_CACHE: Dict[str, List[float]] = {}
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def cache_key(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+if PINECONE_API_KEY:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
 
-async def get_embedding(text: str):
-    key = cache_key(text)
+if pc and INDEX_PRIMARY:
+    index_primary = pc.Index(INDEX_PRIMARY)
 
-    if key in EMBED_CACHE:
-        return EMBED_CACHE[key]
+# ═════════════════ APP ═════════════════
 
-    result = await asyncio.to_thread(
-        lambda: gemini_client.models.embed_content(
-            model="text-embedding-004",
-            contents=text,
-        )
-    )
+app = FastAPI(title="Medical AI Safe Deploy")
 
-    vec = result.embeddings[0].values
-    EMBED_CACHE[key] = vec
-    return vec
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ═════════════════ MODELS ═════════════════
 
@@ -86,18 +78,45 @@ class QueryIntent(str, Enum):
 
 # ═════════════════ HELPERS ═════════════════
 
-def normalize(payload: AskPayload) -> str:
-    return (payload.question or payload.text or "").strip()
+def normalize(p: AskPayload) -> str:
+    return (p.question or p.text or "").strip()
 
-# ═════════════════ INTENT ROUTER (FAST PATH) ═════════════════
+# ═════════════════ CACHE ═════════════════
+
+EMBED_CACHE: Dict[str, List[float]] = {}
+
+def cache_key(t: str) -> str:
+    return hashlib.md5(t.encode()).hexdigest()
+
+# ═════════════════ EMBEDDING ═════════════════
+
+async def embed(text: str):
+    if not gemini_client:
+        return []
+
+    key = cache_key(text)
+    if key in EMBED_CACHE:
+        return EMBED_CACHE[key]
+
+    result = await asyncio.to_thread(
+        lambda: gemini_client.models.embed_content(
+            model="text-embedding-004",
+            contents=text,
+        )
+    )
+
+    vec = result.embeddings[0].values
+    EMBED_CACHE[key] = vec
+    return vec
+
+# ═════════════════ INTENT ROUTER ═════════════════
 
 class IntentClassifier:
-
     @staticmethod
     def classify(text: str, score: float = 0.0) -> QueryIntent:
         t = text.lower()
 
-        if any(x in t for x in ["hi", "hello", "مرحبا", "ازيك"]):
+        if any(x in t for x in ["hi", "hello", "ازيك", "مرحبا"]):
             return QueryIntent.GREETING
 
         if any(x in t for x in ["thanks", "شكرا"]):
@@ -106,69 +125,42 @@ class IntentClassifier:
         if any(x in t for x in ["bye", "سلام"]):
             return QueryIntent.FAREWELL
 
-        if score > SCORE_THRESHOLD and len(t.split()) > 3:
-            return QueryIntent.MEDICAL
-
         return QueryIntent.MEDICAL
 
-# ═════════════════ HYBRID SEARCH ═════════════════
+# ═════════════════ SEARCH ═════════════════
 
-def query_index(index, vector):
+def search(vector):
+    if not index_primary:
+        return [], 0.0
+
     try:
-        res = index.query(
+        res = index_primary.query(
             vector=vector,
-            top_k=TOP_K,
+            top_k=7,
             include_metadata=True
         )
-        return [
-            {"text": m.metadata.get("text", ""), "score": m.score}
+
+        docs = [
+            {
+                "text": m.metadata.get("text", ""),
+                "score": m.score
+            }
             for m in res.matches
-            if m.score >= SCORE_THRESHOLD
+            if m.score > 0.6
         ]
-    except:
-        return []
 
+        return docs, (docs[0]["score"] if docs else 0.0)
 
-def hybrid_search(vector):
-    seen = {}
+    except Exception as e:
+        log.error(f"Search error: {e}")
+        return [], 0.0
 
-    for idx in [index_primary, index_legacy]:
-        if not idx:
-            continue
+# ═════════════════ RAG ═════════════════
 
-        for d in query_index(idx, vector):
-            txt = d["text"]
-            if txt not in seen or d["score"] > seen[txt]["score"]:
-                seen[txt] = d
+async def rag_answer(question: str, docs: List[Dict]):
+    if not gemini_client:
+        return "AI service not configured."
 
-    docs = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
-    return docs[:MAX_DOCS], (docs[0]["score"] if docs else 0.0)
-
-# ═════════════════ RERANKER ═════════════════
-
-def rerank(query: str, docs: List[Dict]) -> List[Dict]:
-    q = query.lower()
-    scored = []
-
-    for d in docs:
-        bonus = 0
-
-        if any(w in d["text"].lower() for w in q.split()):
-            bonus += 0.1
-
-        bonus += min(len(d["text"]) / 2000, 0.2)
-
-        d["score"] += bonus
-        scored.append(d)
-
-    return sorted(scored, key=lambda x: x["score"], reverse=True)
-
-# ═════════════════ LLM ═════════════════
-
-async def generate_social():
-    return "أهلاً 👋 ازاي أقدر أساعدك؟"
-
-async def generate_rag(question: str, docs: List[Dict]):
     context = "\n\n".join(d["text"][:300] for d in docs)
 
     prompt = f"""
@@ -188,77 +180,65 @@ async def generate_rag(question: str, docs: List[Dict]):
         )
     )
 
-    return result.text + "\n\n⚠️ تنبيه طبي"
+    return result.text
 
-# ═════════════════ FASTAPI ═════════════════
+# ═════════════════ SOCIAL ═════════════════
 
-app = FastAPI(title="Medical AI vNext")
+async def social_reply():
+    return "أهلاً 👋 ازاي أقدر أساعدك طبيًا؟"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ═════════════════ /ask (UPGRADED PIPELINE) ═════════════════
+# ═════════════════ /ASK ═════════════════
 
 @app.post("/ask")
 async def ask(payload: AskPayload):
 
     q = normalize(payload)
     if not q:
-        return JSONResponse(status_code=400, content={"error": "empty"})
+        return JSONResponse({"error": "empty question"}, status_code=400)
 
-    # 1. FAST INTENT CHECK (NO EMBEDDING)
     intent = IntentClassifier.classify(q)
 
-    if intent in [
-        QueryIntent.GREETING,
-        QueryIntent.GRATITUDE,
-        QueryIntent.FAREWELL,
-    ]:
+    # 🔥 FAST PATH (no embedding)
+    if intent in [QueryIntent.GREETING, QueryIntent.GRATITUDE, QueryIntent.FAREWELL]:
         return {
             "query": q,
-            "gemini_reply": await generate_social(),
+            "reply": await social_reply(),
             "intent": intent.value,
-            "is_medical": False,
+            "is_medical": False
         }
 
-    # 2. EMBEDDING (cached)
-    vector = await get_embedding(q)
+    # 🔥 EMBEDDING (safe)
+    vector = await embed(q)
 
-    # 3. SEARCH
-    docs, score = await asyncio.to_thread(hybrid_search, vector)
+    # 🔥 SEARCH
+    docs, score = await asyncio.to_thread(search, vector)
 
-    # 4. RERANK
-    docs = rerank(q, docs)
-
-    # 5. NO DATA
     if not docs:
         return {
             "query": q,
-            "gemini_reply": "مفيش بيانات كافية.",
-            "is_medical": True,
+            "reply": "مفيش بيانات كافية في قاعدة المعرفة.",
+            "is_medical": True
         }
 
-    # 6. RAG RESPONSE
-    answer = await generate_rag(q, docs)
+    # 🔥 RAG
+    answer = await rag_answer(q, docs)
 
     return {
         "query": q,
-        "gemini_reply": answer,
+        "reply": answer,
         "matches": docs,
         "intent": intent.value,
         "low_confidence": score < 0.75,
-        "is_medical": True,
+        "is_medical": True
     }
 
-# ═════════════════ HEALTH ═════════════════
+# ═════════════════ HEALTH (ALWAYS SAFE) ═════════════════
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "cache_size": len(EMBED_CACHE)
+        "gemini": bool(GEMINI_API_KEY),
+        "pinecone": bool(PINECONE_API_KEY),
+        "index": bool(INDEX_PRIMARY)
     }
