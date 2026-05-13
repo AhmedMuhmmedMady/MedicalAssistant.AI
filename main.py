@@ -168,21 +168,30 @@ class QueryContext:
 # Pydantic Schemas
 # ─────────────────────────────────────────────
 
+class AskHistoryItem(BaseModel):
+    role: str
+    parts: List[str]
+
+
 class AskRequest(BaseModel):
-    # Accept both "text" (internal) and "question" (C# client) field names
     text: Optional[str] = None
     question: Optional[str] = None
+    history: Optional[List[AskHistoryItem]] = None
 
     @property
     def query(self) -> str:
-        """Unified accessor regardless of which field was sent."""
         return (self.text or self.question or "").strip()
 
     def model_post_init(self, __context) -> None:
         if not self.query:
-            raise ValueError("Request must include a non-empty 'text' or 'question' field.")
+            raise ValueError(
+                "Request must include a non-empty 'text' or 'question' field."
+            )
+
         if len(self.query) > MAX_QUERY_LENGTH:
-            raise ValueError(f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters.")
+            raise ValueError(
+                f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters."
+            )
 
 
 class MatchResult(BaseModel):
@@ -203,6 +212,13 @@ class AskResponse(BaseModel):
     disclaimer: str
     language: str
 
+
+class MedicalImageResponse(BaseModel):
+    status: str
+    analysis_ar: Optional[str] = None
+    technical_details: Optional[str] = None
+    model_used: Optional[str] = None
+    disclaimer: Optional[str] = None
 
 # ─────────────────────────────────────────────
 # Service Layer
@@ -280,84 +296,92 @@ class PromptBuilder:
         "أنت 'سيلا'، مساعد طبي ذكي ومتخصص يعمل كمرجع طبي موثوق.\n"
         "أسلوبك: دافئ واحترافي، كأنك طبيب يشرح لمريضه بوضوح واهتمام.\n"
         "القواعد الصارمة:\n"
-        "1. أجب فقط بناءً على الحالات الطبية المقدمة في السياق أدناه — لا تتجاوزها.\n"
-        "2. لا تستخدم أي معرفة خارجية أو افتراضات من تلقاء نفسك.\n"
-        "3. إذا كانت المعلومات المتاحة غير كافية، قل بوضوح: 'معلوماتي محدودة في هذه الحالة'.\n"
-        "4. لا تضع تشخيصاً نهائياً — قدم احتمالات وتوجيهاً مبنياً على البيانات المتاحة.\n"
-        "5. اذكر علامات الخطر التي تستدعي التوجه للطوارئ فوراً إن وُجدت في السياق.\n"
-        "6. اختم دائماً بتوصية بمراجعة الطبيب المختص."
+        "1. أجب فقط بناءً على الحالات الطبية المقدمة في السياق أدناه.\n"
+        "2. لا تستخدم أي معرفة خارجية.\n"
+        "3. إذا المعلومات غير كافية قل: 'معلوماتي محدودة في هذه الحالة'.\n"
+        "4. لا تقدم تشخيص نهائي.\n"
+        "5. اذكر علامات الخطر إن وجدت.\n"
+        "6. اختم بتوصية بمراجعة الطبيب."
     )
 
     _SYSTEM_EN = (
-        "You are 'Sila', a specialized medical AI assistant serving as a reliable medical reference.\n"
-        "Your tone: warm and professional, like a doctor explaining clearly to their patient.\n"
+        "You are 'Sila', a medical AI assistant and reliable medical reference.\n"
+        "Tone: warm and professional.\n"
         "Strict rules:\n"
-        "1. Answer ONLY based on the medical cases provided in the context below — do not go beyond it.\n"
-        "2. Do NOT use external knowledge or personal assumptions.\n"
-        "3. If available information is insufficient, clearly state: 'My knowledge is limited on this case.'\n"
-        "4. Do NOT give a final diagnosis — provide possible explanations based on available data.\n"
-        "5. Mention emergency warning signs if the context suggests any.\n"
-        "6. Always end with a recommendation to consult the appropriate specialist."
+        "1. Use ONLY provided medical context.\n"
+        "2. Do NOT use external knowledge.\n"
+        "3. If insufficient data say: 'My knowledge is limited on this case.'\n"
+        "4. Do NOT give final diagnosis.\n"
+        "5. Mention warning signs if present.\n"
+        "6. Always recommend consulting a doctor."
     )
 
-    _NO_DATA_RESPONSE_AR = (
-        "عذراً، لا تتوفر في قاعدة بياناتنا الطبية معلومات كافية لهذه الحالة بالتحديد.\n\n"
-        "**نصيحتنا:**\n"
-        "• تواصل مع طبيب متخصص للحصول على تقييم دقيق لحالتك.\n"
-        "• إذا كانت الأعراض حادة أو مفاجئة، توجه للطوارئ فوراً.\n\n"
-        "_سيتم توسيع قاعدة بياناتنا باستمرار لتغطية حالات أكثر._"
-    )
+    # 🧠 NEW: Language control layer
+    _LANGUAGE_CONTROL = """
+You are a bilingual medical assistant.
 
-    _NO_DATA_RESPONSE_EN = (
-        "We're sorry, our medical database doesn't contain sufficient information for this specific case.\n\n"
-        "**Our recommendation:**\n"
-        "• Please consult a qualified physician for a proper evaluation.\n"
-        "• If symptoms are severe or sudden, seek emergency care immediately.\n\n"
-        "_Our database is continuously expanding to cover more cases._"
-    )
+DEFAULT LANGUAGE: Arabic.
 
-    def get_no_data_response(self, language: str) -> str:
-        return self._NO_DATA_RESPONSE_AR if language == "ar" else self._NO_DATA_RESPONSE_EN
+Rules:
+- If user explicitly requests English (e.g. "English", "answer in English", "رد بالانجليزي")
+  → respond fully in English.
+- If user explicitly requests Arabic (e.g. "Arabic", "رد بالعربي", "ارجع عربي")
+  → respond fully in Arabic.
+- If no request is given → use DEFAULT (Arabic).
+- NEVER mix languages in one response.
+- Medical terms must remain accurate in any language.
+"""
 
     def build(self, ctx: QueryContext) -> str:
-        system    = self._SYSTEM_AR if ctx.language == "ar" else self._SYSTEM_EN
-        lang_note = "أجب باللغة العربية فقط." if ctx.language == "ar" else "Answer in English only."
 
+        system = self._SYSTEM_AR if ctx.language == "ar" else self._SYSTEM_EN
+
+        lang_note = (
+            "أجب باللغة العربية فقط (إلا إذا طلب المستخدم تغيير اللغة)."
+            if ctx.language == "ar"
+            else "Answer in English only (unless user requests otherwise)."
+        )
+
+        # ── Build context ─────────────────────────────
         context_parts = []
+
         for i, m in enumerate(ctx.matches):
             context_parts.append(
-                f"[حالة {i + 1} — ثقة: {m.confidence:.0%}]\n"
-                f"الأعراض: {m.symptom}\n"
-                f"التوجيه الطبي: {m.reply}\n"
-                f"التصنيف: {m.category}"
+                f"[Case {i + 1} — Confidence: {m.confidence:.0%}]\n"
+                f"Symptoms: {m.symptom}\n"
+                f"Medical guidance: {m.reply}\n"
+                f"Category: {m.category}"
             )
+
         context_block = "\n\n".join(context_parts)
 
         structure_note = (
-            "قدم إجابة منظمة تشمل (بناءً على السياق المتاح فقط):\n"
-            "• الأسباب المحتملة\n"
-            "• التوصيات الفورية\n"
-            "• التخصص الطبي المناسب\n"
-            "• علامات الخطر إن وُجدت"
-            if ctx.language == "ar" else
-            "Provide a structured response covering (based on available context only):\n"
+            "Provide structured response:\n"
             "• Possible causes\n"
-            "• Immediate recommendations\n"
-            "• Appropriate medical specialty\n"
-            "• Warning signs if applicable"
+            "• Recommendations\n"
+            "• Medical specialty\n"
+            "• Warning signs"
+            if ctx.language == "en"
+            else
+            "قدم إجابة منظمة تشمل:\n"
+            "• الأسباب المحتملة\n"
+            "• التوصيات\n"
+            "• التخصص المناسب\n"
+            "• علامات الخطر"
         )
 
         return (
-            f"{system}\n{lang_note}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📋 السياق الطبي المتاح:\n\n"
+            f"{system}\n\n"
+            f"{self._LANGUAGE_CONTROL}\n\n"
+            f"{lang_note}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📋 Medical Context:\n\n"
             f"{context_block}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 سؤال المريض: {ctx.raw_query}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧑‍⚕️ Patient Question: {ctx.raw_query}\n\n"
             f"{structure_note}\n\n"
-            "الإجابة:"
+            "Answer:"
         )
-
 
 class GeminiService:
     """
@@ -571,7 +595,158 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ─────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────
+@app.post("/ask", response_model=AskResponse)
+async def ask(req: AskRequest):
+    q = req.query
+    language = LanguageDetector.detect(q)
 
+    intent = IntentClassifier.classify(q)
+
+    if intent == "social":
+        reply, model_used = state.gemini.reply_social(q)
+
+        return AskResponse(
+            query=q,
+            gemini_reply=reply,
+            model_used=model_used,
+            matches=[],
+            low_confidence=False,
+            is_medical=False,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+        )
+
+    matches = state.knowledge_base.search(q, top_k=5)
+
+    is_medical = (
+        intent == "medical"
+        or MedicalClassifier.is_medical(q, matches)
+    )
+
+    if not is_medical:
+        reply, model_used = state.gemini.reply_social(q)
+
+        return AskResponse(
+            query=q,
+            gemini_reply=reply,
+            model_used=model_used,
+            matches=[],
+            low_confidence=True,
+            is_medical=False,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+        )
+
+    ctx = QueryContext(
+        raw_query=q,
+        language=language,
+        is_medical=True,
+        matches=matches,
+    )
+
+    if not ctx.has_reliable_matches:
+        reply = state.prompt_builder.get_no_data_response(language)
+
+        return AskResponse(
+            query=q,
+            gemini_reply=reply,
+            model_used="none",
+            matches=[MatchResult(**m.__dict__) for m in matches],
+            low_confidence=True,
+            is_medical=True,
+            found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER,
+            language=language,
+        )
+
+    prompt = state.prompt_builder.build(ctx)
+
+    reply, model_used = state.gemini.generate(prompt)
+
+    return AskResponse(
+        query=q,
+        gemini_reply=reply,
+        model_used=model_used,
+        matches=[MatchResult(**m.__dict__) for m in matches],
+        low_confidence=False,
+        is_medical=True,
+        found_in_database=True,
+        disclaimer=MEDICAL_DISCLAIMER,
+        language=language,
+    )
+@app.post("/analyze-image", response_model=MedicalImageResponse)
+async def analyze_image(file: UploadFile = File(...)):
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "analysis_ar": "نوع الصورة غير مدعوم.",
+                "technical_details": f"Unsupported file type: {file.content_type}",
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
+            },
+        )
+
+    try:
+        image_bytes = await file.read()
+    except Exception as e:
+        log.error(f"Failed to read uploaded image: {e}")
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "analysis_ar": "فشل في قراءة الصورة.",
+                "technical_details": str(e),
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
+            },
+        )
+
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "analysis_ar": "حجم الصورة كبير جداً.",
+                "technical_details": (
+                    f"Maximum allowed size is "
+                    f"{MAX_IMAGE_SIZE // (1024 * 1024)}MB."
+                ),
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
+            },
+        )
+
+    status, analysis, model_used = state.gemini.analyze_image(
+        image_bytes,
+        file.content_type,
+    )
+
+    http_status = 503 if status == "error" else 200
+
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "status": status,
+            "analysis_ar": analysis,
+            "technical_details": None,
+            "model_used": model_used,
+            "disclaimer": MEDICAL_DISCLAIMER,
+        },
+    )
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "version": "7.0.0",
+        "cache_size": state.gemini.cache_size if state.gemini else 0,
+        "min_confidence_threshold": MIN_CONFIDENCE,
+        "image_analysis": "enabled",
+    }
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
     q        = req.query
