@@ -1,519 +1,264 @@
-# ============================================================
-# Medical AI Assistant — Strict RAG + Social AI Edition v9
-# ============================================================
-
 from __future__ import annotations
 
 import os
+import re
 import json
+import base64
+import hashlib
 import logging
-from typing import List, Dict, Any
+import asyncio
+from enum import Enum
+from typing import List, Dict, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from google import genai
 from pinecone import Pinecone
 
-# ============================================================
-# Logging
-# ============================================================
+# ═════════════════ LOGGING ═════════════════
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("medical-ai")
 
-# ============================================================
-# Environment Variables
-# ============================================================
+# ═════════════════ ENV ═════════════════
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+INDEX_PRIMARY = os.getenv("PINECONE_INDEX_PRIMARY", "")
+INDEX_LEGACY = os.getenv("PINECONE_INDEX_LEGACY", "")
 
-if not GEMINI_API_KEY:
-    raise ValueError("Missing GEMINI_API_KEY")
+TOP_K = int(os.getenv("TOP_K", "7"))
+MAX_DOCS = int(os.getenv("MAX_DOCS", "10"))
+SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.6"))
 
-if not PINECONE_API_KEY:
-    raise ValueError("Missing PINECONE_API_KEY")
+if not all([GEMINI_API_KEY, PINECONE_API_KEY, INDEX_PRIMARY]):
+    raise ValueError("Missing env vars")
 
-if not PINECONE_INDEX:
-    raise ValueError("Missing PINECONE_INDEX")
-
-# ============================================================
-# Gemini Client
-# ============================================================
+# ═════════════════ CLIENTS ═════════════════
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# ============================================================
-# Pinecone
-# ============================================================
-
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX)
+index_primary = pc.Index(INDEX_PRIMARY)
+index_legacy = pc.Index(INDEX_LEGACY) if INDEX_LEGACY else None
 
-# ============================================================
-# FastAPI App
-# ============================================================
+# ═════════════════ SIMPLE CACHE ═════════════════
 
-app = FastAPI(
-    title="Medical AI Assistant",
-    version="9.0.0",
-)
+EMBED_CACHE: Dict[str, List[float]] = {}
+
+def cache_key(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
+
+async def get_embedding(text: str):
+    key = cache_key(text)
+
+    if key in EMBED_CACHE:
+        return EMBED_CACHE[key]
+
+    result = await asyncio.to_thread(
+        lambda: gemini_client.models.embed_content(
+            model="text-embedding-004",
+            contents=text,
+        )
+    )
+
+    vec = result.embeddings[0].values
+    EMBED_CACHE[key] = vec
+    return vec
+
+# ═════════════════ MODELS ═════════════════
+
+class AskPayload(BaseModel):
+    question: Optional[str] = None
+    text: Optional[str] = None
+
+
+class QueryIntent(str, Enum):
+    GREETING = "greeting"
+    GRATITUDE = "gratitude"
+    FAREWELL = "farewell"
+    MEDICAL = "medical"
+
+# ═════════════════ HELPERS ═════════════════
+
+def normalize(payload: AskPayload) -> str:
+    return (payload.question or payload.text or "").strip()
+
+# ═════════════════ INTENT ROUTER (FAST PATH) ═════════════════
+
+class IntentClassifier:
+
+    @staticmethod
+    def classify(text: str, score: float = 0.0) -> QueryIntent:
+        t = text.lower()
+
+        if any(x in t for x in ["hi", "hello", "مرحبا", "ازيك"]):
+            return QueryIntent.GREETING
+
+        if any(x in t for x in ["thanks", "شكرا"]):
+            return QueryIntent.GRATITUDE
+
+        if any(x in t for x in ["bye", "سلام"]):
+            return QueryIntent.FAREWELL
+
+        if score > SCORE_THRESHOLD and len(t.split()) > 3:
+            return QueryIntent.MEDICAL
+
+        return QueryIntent.MEDICAL
+
+# ═════════════════ HYBRID SEARCH ═════════════════
+
+def query_index(index, vector):
+    try:
+        res = index.query(
+            vector=vector,
+            top_k=TOP_K,
+            include_metadata=True
+        )
+        return [
+            {"text": m.metadata.get("text", ""), "score": m.score}
+            for m in res.matches
+            if m.score >= SCORE_THRESHOLD
+        ]
+    except:
+        return []
+
+
+def hybrid_search(vector):
+    seen = {}
+
+    for idx in [index_primary, index_legacy]:
+        if not idx:
+            continue
+
+        for d in query_index(idx, vector):
+            txt = d["text"]
+            if txt not in seen or d["score"] > seen[txt]["score"]:
+                seen[txt] = d
+
+    docs = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    return docs[:MAX_DOCS], (docs[0]["score"] if docs else 0.0)
+
+# ═════════════════ RERANKER ═════════════════
+
+def rerank(query: str, docs: List[Dict]) -> List[Dict]:
+    q = query.lower()
+    scored = []
+
+    for d in docs:
+        bonus = 0
+
+        if any(w in d["text"].lower() for w in q.split()):
+            bonus += 0.1
+
+        bonus += min(len(d["text"]) / 2000, 0.2)
+
+        d["score"] += bonus
+        scored.append(d)
+
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+# ═════════════════ LLM ═════════════════
+
+async def generate_social():
+    return "أهلاً 👋 ازاي أقدر أساعدك؟"
+
+async def generate_rag(question: str, docs: List[Dict]):
+    context = "\n\n".join(d["text"][:300] for d in docs)
+
+    prompt = f"""
+السياق:
+{context}
+
+السؤال:
+{question}
+
+أجب فقط من السياق.
+"""
+
+    result = await asyncio.to_thread(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+    )
+
+    return result.text + "\n\n⚠️ تنبيه طبي"
+
+# ═════════════════ FASTAPI ═════════════════
+
+app = FastAPI(title="Medical AI vNext")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# Constants
-# ============================================================
-
-MEDICAL_DISCLAIMER = (
-    "⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط "
-    "ولا تُغني عن استشارة طبيب متخصص."
-)
-
-# ============================================================
-# System Prompts
-# ============================================================
-
-INTENT_SYSTEM_PROMPT = """
-You are an intent classifier.
-
-Classify the user message into ONLY one category:
-
-social
-medical
-
-RULES:
-- Greetings => social
-- Thanks => social
-- Casual conversation => social
-- Emotional talk => social
-- Symptoms => medical
-- Diseases => medical
-- Medicines => medical
-- Pain => medical
-- Medical questions => medical
-
-Return ONLY:
-social
-
-OR
-
-medical
-"""
-
-SOCIAL_SYSTEM_PROMPT = """
-You are a friendly Egyptian medical AI assistant.
-
-RULES:
-- Speak naturally.
-- Use Egyptian Arabic naturally.
-- Be warm and conversational.
-- Keep responses short.
-- Don't act robotic.
-- Don't diagnose in social mode.
-- If symptoms appear, ask the user to explain more.
-"""
-
-RAG_SYSTEM_PROMPT = """
-You are a professional medical AI assistant.
-
-STRICT RULES:
-- Answer ONLY from the provided medical context.
-- If context is insufficient say so clearly.
-- Never hallucinate medical information.
-- Use Arabic.
-- Be medically safe.
-- Keep answers clear and useful.
-"""
-
-VISION_SYSTEM_PROMPT = """
-You are a medical vision AI assistant.
-
-Analyze the medical image carefully.
-
-IMPORTANT:
-- Respond ONLY with valid JSON.
-- No markdown.
-- No extra text.
-
-Required JSON format:
-
-{
-  "status": "success",
-  "analysis_ar": "<Arabic explanation>",
-  "technical_details": "<English technical details>"
-}
-
-If image is not medical:
-
-{
-  "status": "error",
-  "analysis_ar": "الصورة المرفوعة ليست صورة طبية.",
-  "technical_details": "Non-medical image."
-}
-"""
-
-# ============================================================
-# Helper Functions
-# ============================================================
-
-async def detect_intent(message: str) -> str:
-
-    try:
-
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=message,
-            config={
-                "temperature": 0,
-                "max_output_tokens": 5,
-                "system_instruction": INTENT_SYSTEM_PROMPT,
-            },
-        )
-
-        result = response.text.strip().lower()
-
-        if "medical" in result:
-            return "medical"
-
-        return "social"
-
-    except Exception as ex:
-
-        log.exception("Intent detection failed: %s", ex)
-
-        return "medical"
-
-
-# ============================================================
-# Pinecone Search
-# ============================================================
-
-def search_medical_context(question: str) -> List[str]:
-
-    try:
-
-        embedding_response = gemini_client.models.embed_content(
-            model="text-embedding-004",
-            contents=question,
-        )
-
-        embedding = embedding_response.embeddings[0].values
-
-        results = index.query(
-            vector=embedding,
-            top_k=5,
-            include_metadata=True,
-        )
-
-        documents = []
-
-        for match in results.matches:
-
-            metadata = match.metadata or {}
-
-            text = metadata.get("text")
-
-            if text:
-                documents.append(text)
-
-        return documents
-
-    except Exception as ex:
-
-        log.exception("Pinecone search failed: %s", ex)
-
-        return []
-
-
-# ============================================================
-# Generate Medical RAG Answer
-# ============================================================
-
-async def generate_rag_answer(
-    question: str,
-    documents: List[str],
-) -> str:
-
-    context = "\n\n".join(documents)
-
-    prompt = f"""
-Medical Context:
-{context}
-
-User Question:
-{question}
-
-Answer ONLY using the medical context above.
-"""
-
-    try:
-
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config={
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "max_output_tokens": 500,
-                "system_instruction": RAG_SYSTEM_PROMPT,
-            },
-        )
-
-        answer = response.text.strip()
-
-        return f"{answer}\n\n{MEDICAL_DISCLAIMER}"
-
-    except Exception as ex:
-
-        log.exception("RAG generation failed: %s", ex)
-
-        return (
-            "حدث خطأ أثناء إنشاء الرد الطبي.\n\n"
-            + MEDICAL_DISCLAIMER
-        )
-
-
-# ============================================================
-# Generate Social Response
-# ============================================================
-
-async def generate_social_response(
-    message: str,
-) -> str:
-
-    try:
-
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=message,
-            config={
-                "temperature": 0.9,
-                "top_p": 0.95,
-                "max_output_tokens": 120,
-                "system_instruction": SOCIAL_SYSTEM_PROMPT,
-            },
-        )
-
-        return response.text.strip()
-
-    except Exception as ex:
-
-        log.exception("Social generation failed: %s", ex)
-
-        return "أهلاً 🌹 تحت أمرك."
-
-
-# ============================================================
-# Parse Vision Response
-# ============================================================
-
-def parse_vision_response(raw_text: str):
-
-    clean = (
-        raw_text
-        .replace("```json", "")
-        .replace("```", "")
-        .strip()
-    )
-
-    try:
-
-        parsed = json.loads(clean)
-
-    except Exception:
-
-        return (
-            "success",
-            raw_text,
-            "Raw text response."
-        )
-
-    status = parsed.get("status", "success")
-
-    analysis = (
-        parsed.get("analysis_ar")
-        or parsed.get("analysis")
-        or "لم يتمكن النظام من إنشاء تحليل."
-    )
-
-    technical = (
-        parsed.get("technical_details")
-        or "No technical details."
-    )
-
-    return (
-        status,
-        analysis,
-        technical,
-    )
-
-
-# ============================================================
-# Root Endpoint
-# ============================================================
-
-@app.get("/")
-async def root():
-
-    return {
-        "status": "running",
-        "service": "Medical AI Assistant v9"
-    }
-
-
-# ============================================================
-# Ask Endpoint
-# ============================================================
+# ═════════════════ /ask (UPGRADED PIPELINE) ═════════════════
 
 @app.post("/ask")
-async def ask(payload: Dict[str, Any]):
+async def ask(payload: AskPayload):
 
-    question = payload.get("question")
+    q = normalize(payload)
+    if not q:
+        return JSONResponse(status_code=400, content={"error": "empty"})
 
-    if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="Question is required."
-        )
+    # 1. FAST INTENT CHECK (NO EMBEDDING)
+    intent = IntentClassifier.classify(q)
 
-    # ========================================================
-    # Intent Detection
-    # ========================================================
+    if intent in [
+        QueryIntent.GREETING,
+        QueryIntent.GRATITUDE,
+        QueryIntent.FAREWELL,
+    ]:
+        return {
+            "query": q,
+            "gemini_reply": await generate_social(),
+            "intent": intent.value,
+            "is_medical": False,
+        }
 
-    intent = await detect_intent(question)
+    # 2. EMBEDDING (cached)
+    vector = await get_embedding(q)
 
-    # ========================================================
-    # SOCIAL MODE
-    # ========================================================
+    # 3. SEARCH
+    docs, score = await asyncio.to_thread(hybrid_search, vector)
 
-    if intent == "social":
+    # 4. RERANK
+    docs = rerank(q, docs)
 
-        reply = await generate_social_response(question)
+    # 5. NO DATA
+    if not docs:
+        return {
+            "query": q,
+            "gemini_reply": "مفيش بيانات كافية.",
+            "is_medical": True,
+        }
 
-        return JSONResponse(content={
-            "status": "success",
-            "intent": "social",
-            "reply": reply,
-            "source": "gemini-social",
-        })
+    # 6. RAG RESPONSE
+    answer = await generate_rag(q, docs)
 
-    # ========================================================
-    # MEDICAL MODE
-    # ========================================================
+    return {
+        "query": q,
+        "gemini_reply": answer,
+        "matches": docs,
+        "intent": intent.value,
+        "low_confidence": score < 0.75,
+        "is_medical": True,
+    }
 
-    documents = search_medical_context(question)
+# ═════════════════ HEALTH ═════════════════
 
-    if not documents:
-
-        return JSONResponse(content={
-            "status": "success",
-            "intent": "medical",
-            "source": "fallback",
-            "reply": (
-                "مش لاقي معلومات كافية في قاعدة البيانات "
-                "عشان أجاوب بدقة. "
-                "ممكن توضّح سؤالك أو الأعراض أكتر؟\n\n"
-                + MEDICAL_DISCLAIMER
-            )
-        })
-
-    answer = await generate_rag_answer(
-        question=question,
-        documents=documents,
-    )
-
-    return JSONResponse(content={
-        "status": "success",
-        "intent": "medical",
-        "reply": answer,
-        "source": "rag",
-    })
-
-
-# ============================================================
-# Analyze Medical Image Endpoint
-# ============================================================
-
-@app.post("/analyze-image")
-async def analyze_image(
-    file: UploadFile = File(...)
-):
-
-    try:
-
-        image_bytes = await file.read()
-
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                {
-                    "mime_type": file.content_type,
-                    "data": image_bytes,
-                },
-                "Analyze this medical image."
-            ],
-            config={
-                "temperature": 0.2,
-                "max_output_tokens": 700,
-                "system_instruction": VISION_SYSTEM_PROMPT,
-            },
-        )
-
-        raw_text = response.text.strip()
-
-        (
-            status,
-            analysis,
-            technical,
-        ) = parse_vision_response(raw_text)
-
-        return JSONResponse(content={
-            "status": status,
-            "analysis_ar": analysis,
-            "technical_details": technical,
-            "model_used": "gemini-2.5-flash",
-            "disclaimer": MEDICAL_DISCLAIMER,
-        })
-
-    except Exception as ex:
-
-        log.exception("Image analysis failed: %s", ex)
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "analysis_ar": (
-                    "حدث خطأ أثناء تحليل الصورة الطبية."
-                ),
-                "technical_details": str(ex),
-                "model_used": "gemini-2.5-flash",
-                "disclaimer": MEDICAL_DISCLAIMER,
-            }
-        )
-
-
-# ============================================================
-# Run Local
-# ============================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-    )
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "cache_size": len(EMBED_CACHE)
+    }
