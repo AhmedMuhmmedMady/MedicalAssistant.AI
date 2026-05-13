@@ -66,8 +66,7 @@ app.add_middleware(
 # ═════════════════ MODELS ═════════════════
 
 class AskPayload(BaseModel):
-    question: Optional[str] = None
-    text: Optional[str] = None
+    question: str
 
 
 class QueryIntent(str, Enum):
@@ -79,7 +78,7 @@ class QueryIntent(str, Enum):
 # ═════════════════ HELPERS ═════════════════
 
 def normalize(p: AskPayload) -> str:
-    return (p.question or p.text or "").strip()
+    return p.question.strip()
 
 # ═════════════════ CACHE ═════════════════
 
