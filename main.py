@@ -1,6 +1,7 @@
 """
-Medical AI Assistant — Strict RAG Edition v5.0
+Medical AI Assistant — Strict RAG Edition v6.0
 ===============================================
+- Migrated from google-generativeai → google-genai (new SDK)
 - Answers ONLY from Pinecone knowledge base (text queries)
 - Analyzes medical images via Gemini Vision (/analyze-image)
 - If no relevant match is found, says so clearly
@@ -15,7 +16,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -36,7 +38,6 @@ MAX_IMAGE_SIZE   = int(os.getenv("MAX_IMAGE_SIZE_MB", "10")) * 1024 * 1024
 
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
@@ -60,7 +61,8 @@ if not GEMINI_API_KEY:
 if not PINECONE_API_KEY:
     raise RuntimeError("Missing PINECONE_API_KEY environment variable.")
 
-genai.configure(api_key=GEMINI_API_KEY)
+# ── New SDK: single client instance ────────────────────────────────────────
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,7 +158,7 @@ class QueryContext:
 
 
 # ─────────────────────────────────────────────
-# Pydantic Schemas (API layer)
+# Pydantic Schemas
 # ─────────────────────────────────────────────
 
 class AskRequest(BaseModel):
@@ -240,8 +242,6 @@ class KnowledgeBaseService:
 
 
 class PromptBuilder:
-    """Builds strict RAG prompts — Gemini answers ONLY from provided context."""
-
     _SYSTEM_AR = (
         "أنت مساعد طبي ذكي ومتخصص. مهمتك تقديم ردود طبية احترافية ودقيقة.\n"
         "القواعد الصارمة:\n"
@@ -322,8 +322,19 @@ class PromptBuilder:
 
 
 class GeminiService:
+    """
+    Wrapper around the new google-genai SDK.
+    Uses gemini_client (module-level) for all calls.
+    """
+
     def __init__(self):
         self._cache: dict[str, tuple[str, str]] = {}
+
+    def _config(self) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=2048,
+        )
 
     # ── Text generation ────────────────────────────────────────────────
     def generate(self, prompt: str) -> tuple[str, str]:
@@ -336,14 +347,11 @@ class GeminiService:
         for model_name in GEMINI_MODELS:
             try:
                 log.info(f"Calling model: {model_name}")
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config=genai.GenerationConfig(
-                        temperature=0.2,
-                        max_output_tokens=2048,
-                    ),
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=self._config(),
                 )
-                response = model.generate_content(prompt)
                 text = response.text.strip()
                 self._cache[cache_key] = (text, model_name)
                 return text, model_name
@@ -360,28 +368,19 @@ class GeminiService:
         Analyze a medical image using Gemini Vision.
         Returns (status, analysis, model_used).
         """
-        image_b64  = base64.b64encode(image_bytes).decode("utf-8")
         last_error = None
 
         for model_name in GEMINI_VISION_MODELS:
             try:
                 log.info(f"Trying vision model: {model_name}")
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config=genai.GenerationConfig(
-                        temperature=0.2,
-                        max_output_tokens=2048,
-                    ),
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        VISION_SYSTEM_PROMPT,
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    ],
+                    config=self._config(),
                 )
-                response = model.generate_content([
-                    VISION_SYSTEM_PROMPT,
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": image_b64,
-                        }
-                    }
-                ])
                 raw_text = response.text.strip()
 
                 # Parse JSON response from Gemini
@@ -435,7 +434,7 @@ async def lifespan(app: FastAPI):
     state.gemini         = GeminiService()
     state.prompt_builder = PromptBuilder()
 
-    log.info("✅ Medical AI Assistant v5.0 is ready.")
+    log.info("✅ Medical AI Assistant v6.0 is ready.")
     yield
     log.info("🛑 Shutdown complete.")
 
@@ -447,7 +446,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Medical AI Assistant",
     description="مساعد طبي ذكي — Strict RAG + Gemini Vision",
-    version="5.0.0",
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -596,7 +595,7 @@ async def analyze_image(file: UploadFile = File(...)):
 def health():
     return {
         "status":                   "ok",
-        "version":                  "5.0.0",
+        "version":                  "6.0.0",
         "cache_size":               state.gemini.cache_size if state.gemini else 0,
         "min_confidence_threshold": MIN_CONFIDENCE,
         "image_analysis":           "enabled",
@@ -607,7 +606,7 @@ def health():
 def root():
     return {
         "name":      "Medical AI Assistant",
-        "version":   "5.0.0",
+        "version":   "6.0.0",
         "mode":      "strict-rag + vision",
         "status":    "running",
         "endpoints": ["/ask", "/analyze-image", "/health"],
