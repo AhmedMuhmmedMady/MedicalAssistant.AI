@@ -330,10 +330,10 @@ class GeminiService:
     def __init__(self):
         self._cache: dict[str, tuple[str, str]] = {}
 
-    def _config(self) -> types.GenerateContentConfig:
+    def _config(self, max_tokens: int = 2048) -> types.GenerateContentConfig:
         return types.GenerateContentConfig(
             temperature=0.2,
-            max_output_tokens=2048,
+            max_output_tokens=max_tokens,
         )
 
     # ── Text generation ────────────────────────────────────────────────
@@ -379,19 +379,41 @@ class GeminiService:
                         VISION_SYSTEM_PROMPT,
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     ],
-                    config=self._config(),
+                    config=self._config(max_tokens=8192),  # larger for detailed image analysis
                 )
                 raw_text = response.text.strip()
 
-                # Parse JSON response from Gemini
+                # Parse JSON response from Gemini — handle nested JSON
                 try:
                     clean  = raw_text.replace("```json", "").replace("```", "").strip()
                     parsed = json.loads(clean)
-                    return (
-                        parsed.get("status",   "success"),
-                        parsed.get("analysis", raw_text),
-                        model_name,
-                    )
+                    status   = parsed.get("status", "success")
+                    analysis = parsed.get("analysis", raw_text)
+
+                    # Gemini sometimes nests another JSON object inside analysis
+                    # Unwrap it recursively until we get a plain string
+                    max_depth = 3
+                    depth = 0
+                    while isinstance(analysis, (dict, list)) and depth < max_depth:
+                        if isinstance(analysis, dict):
+                            inner = analysis.get("analysis")
+                            if inner is not None:
+                                analysis = inner
+                                depth += 1
+                            else:
+                                # Convert dict to readable string
+                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                                break
+                        else:
+                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                            break
+
+                    # Final safety: if still not a string, serialize it
+                    if not isinstance(analysis, str):
+                        analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+
+                    return status, analysis, model_name
+
                 except (json.JSONDecodeError, KeyError):
                     log.warning(f"Vision model {model_name} did not return valid JSON — using raw text.")
                     return "success", raw_text, model_name
