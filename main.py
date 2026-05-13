@@ -32,7 +32,7 @@ from sentence_transformers import SentenceTransformer
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME       = os.getenv("PINECONE_INDEX", "medical-index")
-MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.70"))
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.50"))
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
 MAX_IMAGE_SIZE   = int(os.getenv("MAX_IMAGE_SIZE_MB", "10")) * 1024 * 1024
 
