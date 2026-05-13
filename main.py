@@ -381,7 +381,7 @@ class GeminiService:
         Returns (reply_text, model_used).
         """
         system = (
-            "أنت مساعد طبي ذكي واسمك 'سيلا'. "
+            "أنت مساعد طبي ذكي واسمك 'ماضى'. "
             "ردودك دايماً بالعامية المصرية الدافية والودية، زي طبيب صاحبك. "
             "لو حد بيسلم عليك أو بيشكرك أو بيتكلم معاك بشكل عام، رد عليه بطبيعية ودفا. "
             "لو حد سألك عن حاجة مش طبية، بلطف وده قوله إنك متخصص في الاستشارات الطبية. "
@@ -436,63 +436,72 @@ class GeminiService:
     def analyze_image(self, image_bytes: bytes, mime_type: str) -> tuple[str, str, str]:
         """
         Analyze a medical image using Gemini Vision.
+        Tries types.Part.from_bytes first, falls back to base64 inline_data.
         Returns (status, analysis, model_used).
         """
         last_error = None
 
         for model_name in GEMINI_VISION_MODELS:
-            try:
-                log.info(f"Trying vision model: {model_name}")
-                response = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        VISION_SYSTEM_PROMPT,
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    ],
-                    config=self._config(max_tokens=8192),  # larger for detailed image analysis
-                )
-                raw_text = response.text.strip()
+            # Build contents — try new SDK style first, fallback to base64 dict
+            contents_options = [
+                # Option A: new SDK types.Part (preferred)
+                lambda: [
+                    VISION_SYSTEM_PROMPT,
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                ],
+                # Option B: base64 inline_data dict (legacy compatible)
+                lambda: [
+                    {"text": VISION_SYSTEM_PROMPT},
+                    {"inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }},
+                ],
+            ]
 
-                # Parse JSON response from Gemini — handle nested JSON
+            for build_contents in contents_options:
                 try:
-                    clean  = raw_text.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean)
-                    status   = parsed.get("status", "success")
-                    analysis = parsed.get("analysis", raw_text)
+                    log.info(f"Trying vision model: {model_name}")
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=build_contents(),
+                        config=self._config(max_tokens=8192),
+                    )
+                    raw_text = response.text.strip()
+                    log.info(f"Vision model {model_name} succeeded.")
 
-                    # Gemini sometimes nests another JSON object inside analysis
-                    # Unwrap it recursively until we get a plain string
-                    max_depth = 3
-                    depth = 0
-                    while isinstance(analysis, (dict, list)) and depth < max_depth:
-                        if isinstance(analysis, dict):
-                            inner = analysis.get("analysis")
-                            if inner is not None:
-                                analysis = inner
-                                depth += 1
-                            else:
-                                # Convert dict to readable string
-                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                    # ── Parse JSON — handle nested JSON from Gemini ────────
+                    try:
+                        clean  = raw_text.replace("```json", "").replace("```", "").strip()
+                        parsed = json.loads(clean)
+                        status   = parsed.get("status", "success")
+                        analysis = parsed.get("analysis", raw_text)
+
+                        # Unwrap nested JSON objects recursively (max 3 levels)
+                        for _ in range(3):
+                            if not isinstance(analysis, (dict, list)):
                                 break
-                        else:
+                            if isinstance(analysis, dict):
+                                inner = analysis.get("analysis")
+                                analysis = inner if inner is not None else json.dumps(analysis, ensure_ascii=False, indent=2)
+                            else:
+                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+
+                        if not isinstance(analysis, str):
                             analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
-                            break
 
-                    # Final safety: if still not a string, serialize it
-                    if not isinstance(analysis, str):
-                        analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                        return status, analysis, model_name
 
-                    return status, analysis, model_name
+                    except (json.JSONDecodeError, KeyError):
+                        log.warning(f"Model {model_name} returned non-JSON — using raw text.")
+                        return "success", raw_text, model_name
 
-                except (json.JSONDecodeError, KeyError):
-                    log.warning(f"Vision model {model_name} did not return valid JSON — using raw text.")
-                    return "success", raw_text, model_name
+                except Exception as e:
+                    log.warning(f"Vision model {model_name} / contents style failed: {e}")
+                    last_error = e
+                    continue  # try next contents style
 
-            except Exception as e:
-                log.warning(f"Vision model {model_name} failed: {e}")
-                last_error = e
-
-        log.error(f"All vision models failed. Last error: {last_error}")
+        log.error(f"All vision models and fallback styles failed. Last error: {last_error}")
         return "error", "Medical image analysis service is temporarily unavailable. Please try again later.", "none"
 
     @property
