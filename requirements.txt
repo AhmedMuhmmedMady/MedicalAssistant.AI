@@ -1,10 +1,17 @@
-# Sila Medical RAG — Python Dependencies
+# Sila Medical RAG — Production Dependencies
 
 pinecone-client>=3.0.0
 sentence-transformers>=2.6.0
+
 pandas>=2.0.0
 tqdm>=4.66.0
 python-dotenv>=1.0.0
+
 torch>=2.0.0
+
 fastapi>=0.111.0
 uvicorn>=0.29.0
+
+python-multipart>=0.0.9
+
+google-genai>=0.5.0
