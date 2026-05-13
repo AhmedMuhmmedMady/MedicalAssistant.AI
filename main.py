@@ -1,619 +1,717 @@
-# ============================================================
-# main.py
-# Medical AI Assistant v11
-# Strict Medical RAG + Social AI + Query Rewriting
-# + Conversation Memory + Retry Logic + Pydantic Validation
-# ============================================================
+"""
+Medical AI Assistant — Strict RAG Edition v7.0
+===============================================
+- Migrated from google-generativeai → google-genai (new SDK)
+- Answers ONLY from Pinecone knowledge base (text queries)
+- Analyzes medical images via Gemini Vision (/analyze-image)
+- If no relevant match is found, says so clearly
+"""
 
-from __future__ import annotations
-
-import os
-import json
 import base64
+import hashlib
+import json
 import logging
-import asyncio
-from typing import List, Dict, Any, Optional
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from google import genai
+from google.genai import types
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pinecone import Pinecone
+from pydantic import BaseModel, field_validator
+from sentence_transformers import SentenceTransformer
 
-# ============================================================
-# Logging
-# ============================================================
+# ─────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────
+
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME       = os.getenv("PINECONE_INDEX", "medical-index")
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.70"))
+MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
+MAX_IMAGE_SIZE   = int(os.getenv("MAX_IMAGE_SIZE_MB", "10")) * 1024 * 1024
+
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+]
+
+GEMINI_VISION_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+if not PINECONE_API_KEY:
+    raise RuntimeError("Missing PINECONE_API_KEY environment variable.")
+
+# ── New SDK: single client instance ────────────────────────────────────────
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
+log = logging.getLogger("medical_ai")
+
+
+# ─────────────────────────────────────────────
+# Constants & Prompts
+# ─────────────────────────────────────────────
+
+MEDICAL_DISCLAIMER = (
+    "⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط ولا تُغني عن استشارة طبيب متخصص."
 )
 
-log = logging.getLogger("medical-ai")
+MEDICAL_KEYWORDS_AR = {
+    "ألم", "وجع", "مرض", "دواء", "طبيب", "مستشفى", "أعراض", "علاج",
+    "صداع", "حمى", "سعال", "ضغط", "سكر", "قلب", "كلى", "معدة",
+    "عظام", "جلد", "عين", "أذن", "أنف", "رئة", "كبد", "دم",
+    "تعب", "إرهاق", "دوار", "غثيان", "إسهال", "إمساك", "حرقة",
+    "الم", "عندي", "عندى", "اشعر", "احس", "اعاني", "يؤلم",
+    "بوجعني", "بتوجعني", "حاسس", "حاسه", "حبوب", "طفح", "حكة",
+}
 
-# ============================================================
-# ENV
-# ============================================================
+MEDICAL_KEYWORDS_EN = {
+    "pain", "ache", "fever", "cough", "headache", "nausea", "dizzy",
+    "vomit", "diarrhea", "symptom", "disease", "doctor", "hospital",
+    "medicine", "drug", "blood", "heart", "lung", "kidney", "liver",
+    "diabetes", "pressure", "infection", "allergy", "rash", "swelling",
+    "fatigue", "tired", "breathe", "chest", "stomach", "throat",
+}
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX")
+VISION_SYSTEM_PROMPT = """You are a specialized medical AI assistant trained to analyze medical documents and images.
 
-if not GEMINI_API_KEY:
-    raise ValueError("Missing GEMINI_API_KEY")
-if not PINECONE_API_KEY:
-    raise ValueError("Missing PINECONE_API_KEY")
-if not PINECONE_INDEX:
-    raise ValueError("Missing PINECONE_INDEX")
+STRICT VALIDATION — apply BEFORE any analysis:
+1. You ONLY analyze medical-related images such as:
+   - Laboratory test results (blood work, urine analysis, cultures, lipid panels, CBC, etc.)
+   - Medical prescriptions and medication lists
+   - Radiology images (X-rays, MRI, CT scans, ultrasounds)
+   - Pathology reports and microscopy slides
+   - Medical charts, ECG/EKG readings, vital sign charts
+   - Clinical notes and discharge summaries
 
-# ============================================================
-# Clients
-# ============================================================
+2. If the image is NOT medical, respond ONLY with this exact JSON:
+   {"status": "rejected", "analysis": "This image does not appear to be a medical document. I can only analyze lab results, prescriptions, X-rays, and other medical records."}
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+3. If the image IS medical, respond ONLY with this exact JSON:
+   {"status": "success", "analysis": "<your full structured analysis here>"}
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX)
+4. For medical images, your analysis must include:
+   - Document type identified
+   - Key findings or values observed
+   - Values outside normal range (if any), clearly highlighted
+   - Recommended next steps or specialist to consult
+   - Any urgent findings that require immediate attention
 
-# ============================================================
-# FastAPI
-# ============================================================
+5. NEVER provide a final diagnosis — provide observations and recommend consulting a specialist.
+6. Respond in the SAME language as the text found in the image (Arabic or English).
+7. Output ONLY valid JSON — no markdown, no extra text outside the JSON object."""
 
-app = FastAPI(title="Medical AI Assistant", version="11.0.0")
+
+INTENT_CLASSIFICATION_PROMPT = """Classify the following message into one of two categories:
+- "social"  → greetings, thanks, casual conversation, non-medical small talk
+- "medical" → any question about symptoms, diseases, medications, body parts, pain, health
+
+Respond with EXACTLY one word: social OR medical. Nothing else."""
+
+
+# ─────────────────────────────────────────────
+# Domain Models
+# ─────────────────────────────────────────────
+
+@dataclass
+class KnowledgeMatch:
+    symptom: str
+    reply: str
+    category: str
+    confidence: float
+
+    @property
+    def is_reliable(self) -> bool:
+        return self.confidence >= MIN_CONFIDENCE
+
+
+@dataclass
+class QueryContext:
+    raw_query: str
+    language: str
+    is_medical: bool
+    matches: List[KnowledgeMatch] = field(default_factory=list)
+
+    @property
+    def has_reliable_matches(self) -> bool:
+        return any(m.is_reliable for m in self.matches)
+
+    @property
+    def best_confidence(self) -> float:
+        return self.matches[0].confidence if self.matches else 0.0
+
+
+# ─────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────
+
+class AskRequest(BaseModel):
+    # Accept both "text" (internal) and "question" (C# client) field names
+    text: Optional[str] = None
+    question: Optional[str] = None
+
+    @property
+    def query(self) -> str:
+        """Unified accessor regardless of which field was sent."""
+        return (self.text or self.question or "").strip()
+
+    def model_post_init(self, __context) -> None:
+        if not self.query:
+            raise ValueError("Request must include a non-empty 'text' or 'question' field.")
+        if len(self.query) > MAX_QUERY_LENGTH:
+            raise ValueError(f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters.")
+
+
+class MatchResult(BaseModel):
+    symptom: str
+    reply: str
+    category: str
+    confidence: float
+
+
+class AskResponse(BaseModel):
+    query: str
+    gemini_reply: str
+    model_used: str
+    matches: List[MatchResult]
+    low_confidence: bool
+    is_medical: bool
+    found_in_database: bool
+    disclaimer: str
+    language: str
+
+
+# ─────────────────────────────────────────────
+# Service Layer
+# ─────────────────────────────────────────────
+
+class LanguageDetector:
+    @staticmethod
+    def detect(text: str) -> str:
+        arabic_chars = sum(1 for c in text if "\u0600" <= c <= "\u06ff")
+        ratio = arabic_chars / max(len(text), 1)
+        return "ar" if ratio > 0.3 else "en"
+
+
+class MedicalClassifier:
+    @staticmethod
+    def is_medical(query: str, matches: List[KnowledgeMatch]) -> bool:
+        if matches and matches[0].confidence >= MIN_CONFIDENCE:
+            return True
+        q = query.lower()
+        return any(kw in q for kw in MEDICAL_KEYWORDS_AR | MEDICAL_KEYWORDS_EN)
+
+
+class IntentClassifier:
+    """
+    Uses Gemini to classify whether a query is social or medical.
+    Falls back to keyword-based classification if Gemini is unavailable.
+    """
+    @staticmethod
+    def classify(query: str) -> str:
+        """Returns 'social' or 'medical'."""
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-2.0-flash-lite",   # cheapest & fastest for classification
+                contents=f"{INTENT_CLASSIFICATION_PROMPT}\n\nMessage: {query}",
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=5,
+                ),
+            )
+            result = response.text.strip().lower()
+            return "social" if "social" in result else "medical"
+        except Exception as e:
+            log.warning(f"Intent classification failed, defaulting to keyword check: {e}")
+            return "unknown"
+
+
+class KnowledgeBaseService:
+    def __init__(self, index, embed_model: SentenceTransformer):
+        self._index = index
+        self._embed_model = embed_model
+
+    def search(self, query: str, top_k: int = 5) -> List[KnowledgeMatch]:
+        vector = self._embed_model.encode(query).tolist()
+        result = self._index.query(
+            vector=vector,
+            top_k=top_k,
+            include_metadata=True,
+        )
+        matches = []
+        for m in result.matches:
+            if m.score < MIN_CONFIDENCE * 0.75:
+                continue
+            meta = m.metadata or {}
+            matches.append(KnowledgeMatch(
+                symptom=meta.get("symptom", ""),
+                reply=meta.get("reply", ""),
+                category=meta.get("category", ""),
+                confidence=round(float(m.score), 4),
+            ))
+        return matches
+
+
+class PromptBuilder:
+    _SYSTEM_AR = (
+        "أنت 'سيلا'، مساعد طبي ذكي ومتخصص يعمل كمرجع طبي موثوق.\n"
+        "أسلوبك: دافئ واحترافي، كأنك طبيب يشرح لمريضه بوضوح واهتمام.\n"
+        "القواعد الصارمة:\n"
+        "1. أجب فقط بناءً على الحالات الطبية المقدمة في السياق أدناه — لا تتجاوزها.\n"
+        "2. لا تستخدم أي معرفة خارجية أو افتراضات من تلقاء نفسك.\n"
+        "3. إذا كانت المعلومات المتاحة غير كافية، قل بوضوح: 'معلوماتي محدودة في هذه الحالة'.\n"
+        "4. لا تضع تشخيصاً نهائياً — قدم احتمالات وتوجيهاً مبنياً على البيانات المتاحة.\n"
+        "5. اذكر علامات الخطر التي تستدعي التوجه للطوارئ فوراً إن وُجدت في السياق.\n"
+        "6. اختم دائماً بتوصية بمراجعة الطبيب المختص."
+    )
+
+    _SYSTEM_EN = (
+        "You are 'Sila', a specialized medical AI assistant serving as a reliable medical reference.\n"
+        "Your tone: warm and professional, like a doctor explaining clearly to their patient.\n"
+        "Strict rules:\n"
+        "1. Answer ONLY based on the medical cases provided in the context below — do not go beyond it.\n"
+        "2. Do NOT use external knowledge or personal assumptions.\n"
+        "3. If available information is insufficient, clearly state: 'My knowledge is limited on this case.'\n"
+        "4. Do NOT give a final diagnosis — provide possible explanations based on available data.\n"
+        "5. Mention emergency warning signs if the context suggests any.\n"
+        "6. Always end with a recommendation to consult the appropriate specialist."
+    )
+
+    _NO_DATA_RESPONSE_AR = (
+        "عذراً، لا تتوفر في قاعدة بياناتنا الطبية معلومات كافية لهذه الحالة بالتحديد.\n\n"
+        "**نصيحتنا:**\n"
+        "• تواصل مع طبيب متخصص للحصول على تقييم دقيق لحالتك.\n"
+        "• إذا كانت الأعراض حادة أو مفاجئة، توجه للطوارئ فوراً.\n\n"
+        "_سيتم توسيع قاعدة بياناتنا باستمرار لتغطية حالات أكثر._"
+    )
+
+    _NO_DATA_RESPONSE_EN = (
+        "We're sorry, our medical database doesn't contain sufficient information for this specific case.\n\n"
+        "**Our recommendation:**\n"
+        "• Please consult a qualified physician for a proper evaluation.\n"
+        "• If symptoms are severe or sudden, seek emergency care immediately.\n\n"
+        "_Our database is continuously expanding to cover more cases._"
+    )
+
+    def get_no_data_response(self, language: str) -> str:
+        return self._NO_DATA_RESPONSE_AR if language == "ar" else self._NO_DATA_RESPONSE_EN
+
+    def build(self, ctx: QueryContext) -> str:
+        system    = self._SYSTEM_AR if ctx.language == "ar" else self._SYSTEM_EN
+        lang_note = "أجب باللغة العربية فقط." if ctx.language == "ar" else "Answer in English only."
+
+        context_parts = []
+        for i, m in enumerate(ctx.matches):
+            context_parts.append(
+                f"[حالة {i + 1} — ثقة: {m.confidence:.0%}]\n"
+                f"الأعراض: {m.symptom}\n"
+                f"التوجيه الطبي: {m.reply}\n"
+                f"التصنيف: {m.category}"
+            )
+        context_block = "\n\n".join(context_parts)
+
+        structure_note = (
+            "قدم إجابة منظمة تشمل (بناءً على السياق المتاح فقط):\n"
+            "• الأسباب المحتملة\n"
+            "• التوصيات الفورية\n"
+            "• التخصص الطبي المناسب\n"
+            "• علامات الخطر إن وُجدت"
+            if ctx.language == "ar" else
+            "Provide a structured response covering (based on available context only):\n"
+            "• Possible causes\n"
+            "• Immediate recommendations\n"
+            "• Appropriate medical specialty\n"
+            "• Warning signs if applicable"
+        )
+
+        return (
+            f"{system}\n{lang_note}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📋 السياق الطبي المتاح:\n\n"
+            f"{context_block}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 سؤال المريض: {ctx.raw_query}\n\n"
+            f"{structure_note}\n\n"
+            "الإجابة:"
+        )
+
+
+class GeminiService:
+    """
+    Wrapper around the new google-genai SDK.
+    Uses gemini_client (module-level) for all calls.
+    """
+
+    def __init__(self):
+        self._cache: dict[str, tuple[str, str]] = {}
+
+    def _config(self, max_tokens: int = 2048) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=max_tokens,
+        )
+
+    # ── Social reply (Egyptian Arabic) ────────────────────────────────
+    def reply_social(self, query: str) -> tuple[str, str]:
+        """
+        Generates a warm, friendly reply in Egyptian Arabic for non-medical queries.
+        Returns (reply_text, model_used).
+        """
+        system = (
+            "أنت مساعد طبي ذكي واسمك 'سيلا'. "
+            "ردودك دايماً بالعامية المصرية الدافية والودية، زي طبيب صاحبك. "
+            "لو حد بيسلم عليك أو بيشكرك أو بيتكلم معاك بشكل عام، رد عليه بطبيعية ودفا. "
+            "لو حد سألك عن حاجة مش طبية، بلطف وده قوله إنك متخصص في الاستشارات الطبية. "
+            "الرد يكون قصير (جملة أو اتنين بالكتير)."
+        )
+        last_error = None
+        for model_name in GEMINI_MODELS:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=query,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=0.7,
+                        max_output_tokens=150,
+                    ),
+                )
+                return response.text.strip(), model_name
+            except Exception as e:
+                log.warning(f"Social reply model {model_name} failed: {e}")
+                last_error = e
+        log.error(f"All models failed for social reply: {last_error}")
+        return "أهلاً وسهلاً! 😊 أنا هنا لمساعدتك في أي استفسار طبي.", "none"
+
+    # ── Text generation ────────────────────────────────────────────────
+    def generate(self, prompt: str) -> tuple[str, str]:
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+        if cache_key in self._cache:
+            log.info("Cache hit for prompt.")
+            return self._cache[cache_key]
+
+        last_error = None
+        for model_name in GEMINI_MODELS:
+            try:
+                log.info(f"Calling model: {model_name}")
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=self._config(),
+                )
+                text = response.text.strip()
+                self._cache[cache_key] = (text, model_name)
+                return text, model_name
+            except Exception as e:
+                log.warning(f"Model {model_name} failed: {e}")
+                last_error = e
+
+        log.error(f"All Gemini models failed. Last error: {last_error}")
+        return "عذراً، حدث خطأ مؤقت في الخدمة. يرجى المحاولة مرة أخرى.", "none"
+
+    # ── Vision / image analysis ────────────────────────────────────────
+    def analyze_image(self, image_bytes: bytes, mime_type: str) -> tuple[str, str, str]:
+        """
+        Analyze a medical image using Gemini Vision.
+        Returns (status, analysis, model_used).
+        """
+        last_error = None
+
+        for model_name in GEMINI_VISION_MODELS:
+            try:
+                log.info(f"Trying vision model: {model_name}")
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        VISION_SYSTEM_PROMPT,
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    ],
+                    config=self._config(max_tokens=8192),  # larger for detailed image analysis
+                )
+                raw_text = response.text.strip()
+
+                # Parse JSON response from Gemini — handle nested JSON
+                try:
+                    clean  = raw_text.replace("```json", "").replace("```", "").strip()
+                    parsed = json.loads(clean)
+                    status   = parsed.get("status", "success")
+                    analysis = parsed.get("analysis", raw_text)
+
+                    # Gemini sometimes nests another JSON object inside analysis
+                    # Unwrap it recursively until we get a plain string
+                    max_depth = 3
+                    depth = 0
+                    while isinstance(analysis, (dict, list)) and depth < max_depth:
+                        if isinstance(analysis, dict):
+                            inner = analysis.get("analysis")
+                            if inner is not None:
+                                analysis = inner
+                                depth += 1
+                            else:
+                                # Convert dict to readable string
+                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                                break
+                        else:
+                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                            break
+
+                    # Final safety: if still not a string, serialize it
+                    if not isinstance(analysis, str):
+                        analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+
+                    return status, analysis, model_name
+
+                except (json.JSONDecodeError, KeyError):
+                    log.warning(f"Vision model {model_name} did not return valid JSON — using raw text.")
+                    return "success", raw_text, model_name
+
+            except Exception as e:
+                log.warning(f"Vision model {model_name} failed: {e}")
+                last_error = e
+
+        log.error(f"All vision models failed. Last error: {last_error}")
+        return "error", "Medical image analysis service is temporarily unavailable. Please try again later.", "none"
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+
+# ─────────────────────────────────────────────
+# Application State
+# ─────────────────────────────────────────────
+
+class AppState:
+    knowledge_base: Optional[KnowledgeBaseService] = None
+    gemini: Optional[GeminiService] = None
+    prompt_builder: Optional[PromptBuilder] = None
+
+
+state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("🔧 Loading embedding model...")
+    embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+    log.info("🔌 Connecting to Pinecone...")
+    pc    = Pinecone(api_key=PINECONE_API_KEY)
+    index = pc.Index(INDEX_NAME)
+
+    state.knowledge_base = KnowledgeBaseService(index, embed_model)
+    state.gemini         = GeminiService()
+    state.prompt_builder = PromptBuilder()
+
+    log.info("✅ Medical AI Assistant v7.0 is ready.")
+    yield
+    log.info("🛑 Shutdown complete.")
+
+
+# ─────────────────────────────────────────────
+# FastAPI App
+# ─────────────────────────────────────────────
+
+app = FastAPI(
+    title="Medical AI Assistant",
+    description="مساعد طبي ذكي — Strict RAG + Gemini Vision",
+    version="7.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# Constants
-# ============================================================
 
-DISCLAIMER = (
-    "⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط "
-    "ولا تُغني عن استشارة طبيب متخصص."
-)
-
-MAX_RETRIES = 3
-RETRY_DELAY = 1.5  # seconds
-SCORE_THRESHOLD = 0.65
-TOP_K = 7
-MAX_DOCS = 10
-
-# ============================================================
-# Pydantic Models
-# ============================================================
-
-
-class Message(BaseModel):
-    role: str = Field(..., pattern="^(user|assistant)$")
-    content: str = Field(..., min_length=1, max_length=4000)
-
-
-class AskPayload(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
-    history: Optional[List[Message]] = Field(default_factory=list)
-
-
-class AskResponse(BaseModel):
-    status: str
-    intent: str
-    reply: str
-    source: str
-
-
-# ============================================================
-# SYSTEM PROMPTS
-# ============================================================
-
-INTENT_PROMPT = """
-You are an intent classifier.
-
-Classify ONLY into:
-- social
-- medical
-
-Rules:
-- Greetings, thanks, casual chat => social
-- Symptoms, diseases, medicine, pain, diagnosis => medical
-
-Return ONLY the single word:
-social
-OR
-medical
-""".strip()
-
-SOCIAL_PROMPT = """
-You are a warm Egyptian medical assistant chatbot.
-
-Rules:
-- Speak naturally in Egyptian Arabic (عامية مصرية).
-- Be short, friendly, and human.
-- No robotic or generic replies.
-- Never fabricate diagnoses.
-- If user mentions any symptom, gently ask for more details.
-- Max 3 sentences.
-""".strip()
-
-QUERY_REWRITE_PROMPT = """
-You are a medical query normalizer for a RAG system.
-
-Convert the user message into search-optimized forms.
-
-Return ONLY valid JSON with no markdown:
-{
-  "normalized_ar": "الاستعلام بالعربي الطبي الفصيح",
-  "medical_keywords": "English medical keywords for search",
-  "symptom_query": "symptom-focused Arabic search query"
-}
-""".strip()
-
-RAG_PROMPT = """
-You are a professional Arabic medical AI assistant.
-
-STRICT RULES:
-1. Answer ONLY using the provided medical context.
-2. Never hallucinate or invent information.
-3. If context is insufficient, say so clearly.
-4. Always respond in clear Arabic.
-5. Be medically safe — never recommend stopping prescribed medication.
-6. Structure your answer clearly with short paragraphs.
-7. If the user's history shows follow-up questions, maintain continuity.
-""".strip()
-
-VISION_PROMPT = """
-You are a medical imaging analysis assistant.
-
-Analyze the provided medical image carefully.
-
-Return ONLY valid JSON with no markdown:
-{
-  "status": "success",
-  "analysis_ar": "التحليل باللغة العربية بشكل مفصل",
-  "technical_details": "Technical imaging details in English"
-}
-""".strip()
-
-# ============================================================
-# Retry Wrapper
-# ============================================================
-
-
-async def call_with_retry(fn, *args, retries=MAX_RETRIES, **kwargs):
-    """Call an async or sync function with exponential backoff retry."""
-    last_error = None
-    for attempt in range(retries):
-        try:
-            if asyncio.iscoroutinefunction(fn):
-                return await fn(*args, **kwargs)
-            else:
-                return fn(*args, **kwargs)
-        except Exception as ex:
-            last_error = ex
-            wait = RETRY_DELAY * (2 ** attempt)
-            log.warning(f"Attempt {attempt + 1} failed: {ex}. Retrying in {wait:.1f}s...")
-            await asyncio.sleep(wait)
-    raise last_error
-
-
-# ============================================================
-# Intent Detection
-# ============================================================
-
-
-async def detect_intent(message: str) -> str:
-    try:
-        def _call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=message,
-                config={
-                    "temperature": 0,
-                    "max_output_tokens": 5,
-                    "system_instruction": INTENT_PROMPT,
-                },
-            )
-
-        response = await call_with_retry(_call)
-        result = response.text.strip().lower()
-        return "medical" if "medical" in result else "social"
-
-    except Exception as ex:
-        log.exception(f"Intent detection failed: {ex}")
-        return "medical"  # safe default
-
-
-# ============================================================
-# Social Chat
-# ============================================================
-
-
-async def social_chat(message: str, history: List[Message]) -> str:
-    try:
-        # Build conversation turns for context
-        history_text = ""
-        if history:
-            for msg in history[-6:]:  # last 3 turns
-                prefix = "المستخدم" if msg.role == "user" else "المساعد"
-                history_text += f"{prefix}: {msg.content}\n"
-
-        contents = f"{history_text}المستخدم: {message}" if history_text else message
-
-        def _call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents,
-                config={
-                    "temperature": 0.9,
-                    "top_p": 0.95,
-                    "max_output_tokens": 150,
-                    "system_instruction": SOCIAL_PROMPT,
-                },
-            )
-
-        response = await call_with_retry(_call)
-        return response.text.strip()
-
-    except Exception as ex:
-        log.exception(f"Social chat failed: {ex}")
-        return "أهلاً 🌹 تحت أمرك، كيف أقدر أساعدك؟"
-
-
-# ============================================================
-# Query Rewriter
-# ============================================================
-
-
-async def rewrite_query(question: str) -> Dict[str, str]:
-    try:
-        def _call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=question,
-                config={
-                    "temperature": 0.2,
-                    "max_output_tokens": 300,
-                    "system_instruction": QUERY_REWRITE_PROMPT,
-                },
-            )
-
-        response = await call_with_retry(_call)
-        raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(raw)
-
-        return {
-            "normalized_ar": parsed.get("normalized_ar", question),
-            "medical_keywords": parsed.get("medical_keywords", question),
-            "symptom_query": parsed.get("symptom_query", question),
-        }
-
-    except Exception as ex:
-        log.exception(f"Query rewrite failed: {ex}")
-        return {
-            "normalized_ar": question,
-            "medical_keywords": question,
-            "symptom_query": question,
-        }
-
-
-# ============================================================
-# Embedding (single call, batched internally)
-# ============================================================
-
-
-def create_embedding(text: str) -> List[float]:
-    response = client.models.embed_content(
-        model="text-embedding-004",
-        contents=text,
-    )
-    return response.embeddings[0].values
-
-
-def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
-    """
-    Embed multiple texts. The google-genai SDK embed_content
-    accepts a list — we use that to avoid 4 sequential HTTP calls.
-    Falls back to sequential on error.
-    """
-    try:
-        response = client.models.embed_content(
-            model="text-embedding-004",
-            contents=texts,
-        )
-        return [e.values for e in response.embeddings]
-    except Exception as ex:
-        log.warning(f"Batch embedding failed, falling back to sequential: {ex}")
-        return [create_embedding(t) for t in texts]
-
-
-# ============================================================
-# Pinecone Search
-# ============================================================
-
-
-def pinecone_search(query_embedding: List[float], top_k: int = TOP_K) -> List[Dict]:
-    results = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True,
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled error on {request.url}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error. Please try again later."},
     )
 
-    documents = []
-    for match in results.matches:
-        metadata = match.metadata or {}
-        text = metadata.get("text")
-        score = match.score
 
-        if not text or score < SCORE_THRESHOLD:
-            continue
-
-        documents.append({"score": score, "text": text})
-
-    return documents
-
-
-# ============================================================
-# Multi-Query Retrieval (batched embeddings)
-# ============================================================
-
-
-async def retrieve_documents(question: str) -> List[Dict]:
-    rewritten = await rewrite_query(question)
-
-    queries = [
-        question,
-        rewritten["normalized_ar"],
-        rewritten["medical_keywords"],
-        rewritten["symptom_query"],
-    ]
-
-    # Deduplicate queries before embedding
-    unique_queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))
-
-    # Batch embed all queries in ONE API call
-    embeddings = create_embeddings_batch(unique_queries)
-
-    merged: Dict[str, Dict] = {}
-
-    for embedding in embeddings:
-        docs = pinecone_search(embedding)
-        for doc in docs:
-            text = doc["text"]
-            # Keep highest score if duplicate
-            if text not in merged or doc["score"] > merged[text]["score"]:
-                merged[text] = doc
-
-    ranked = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
-    return ranked[:MAX_DOCS]
-
-
-# ============================================================
-# Generate Medical Answer (with history)
-# ============================================================
-
-
-async def generate_medical_answer(
-    question: str,
-    docs: List[Dict],
-    history: List[Message],
-) -> str:
-    context = "\n\n---\n\n".join(doc["text"] for doc in docs)
-
-    # Build history string for continuity
-    history_text = ""
-    if history:
-        for msg in history[-6:]:
-            prefix = "المستخدم" if msg.role == "user" else "المساعد"
-            history_text += f"{prefix}: {msg.content}\n"
-
-    prompt = f"""
-السياق الطبي:
-{context}
-
-{'سجل المحادثة السابقة:' + chr(10) + history_text if history_text else ''}
-سؤال المستخدم الحالي:
-{question}
-
-أجب فقط باستخدام السياق الطبي المقدم أعلاه.
-""".strip()
-
-    try:
-        def _call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={
-                    "temperature": 0.2,
-                    "top_p": 0.9,
-                    "max_output_tokens": 700,
-                    "system_instruction": RAG_PROMPT,
-                },
-            )
-
-        response = await call_with_retry(_call)
-        answer = response.text.strip()
-        return f"{answer}\n\n{DISCLAIMER}"
-
-    except Exception as ex:
-        log.exception(f"Medical answer generation failed: {ex}")
-        return f"حدث خطأ أثناء إنشاء الرد الطبي.\n\n{DISCLAIMER}"
-
-
-# ============================================================
-# Vision Parser
-# ============================================================
-
-
-def parse_vision_response(raw_text: str):
-    clean = raw_text.replace("```json", "").replace("```", "").strip()
-    try:
-        parsed = json.loads(clean)
-        return (
-            parsed.get("status", "success"),
-            parsed.get("analysis_ar", ""),
-            parsed.get("technical_details", ""),
-        )
-    except Exception:
-        return "success", raw_text, "Raw text response."
-
-
-# ============================================================
-# Routes
-# ============================================================
-
-
-@app.get("/")
-async def root():
-    return {"status": "running", "version": "11.0.0"}
-
-
-@app.get("/health")
-async def health():
-    """Health check — verifies Pinecone connection."""
-    try:
-        stats = index.describe_index_stats()
-        return {
-            "status": "ok",
-            "pinecone_vectors": stats.total_vector_count,
-        }
-    except Exception as ex:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "detail": str(ex)},
-        )
-
-
-# ============================================================
-# /ask  — main chat endpoint
-# ============================================================
-
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(payload: AskPayload):
-    question = payload.question.strip()
-    history = payload.history or []
+async def ask(req: AskRequest):
+    q        = req.query
+    language = LanguageDetector.detect(q)
 
-    intent = await detect_intent(question)
+    # ── Step 1: Intent Classification ──────────────────────────────────
+    intent = IntentClassifier.classify(q)
 
     if intent == "social":
-        reply = await social_chat(question, history)
+        # Warm Egyptian Arabic reply directly from Gemini — no RAG needed
+        reply, model_used = state.gemini.reply_social(q)
         return AskResponse(
-            status="success",
-            intent="social",
-            reply=reply,
-            source="social-ai",
+            query=q, gemini_reply=reply, model_used=model_used,
+            matches=[], low_confidence=False, is_medical=False,
+            found_in_database=False, disclaimer=MEDICAL_DISCLAIMER, language=language,
         )
 
-    # Medical path
-    docs = await retrieve_documents(question)
-
-    if not docs:
-        return AskResponse(
-            status="success",
-            intent="medical",
-            source="fallback",
-            reply=(
-                "مش لاقي معلومات كافية في قاعدة البيانات عشان أجاوب بدقة. "
-                "ممكن توضّح الأعراض أكتر؟\n\n" + DISCLAIMER
-            ),
-        )
-
-    answer = await generate_medical_answer(
-        question=question,
-        docs=docs,
-        history=history,
+    # ── Step 2: Medical path — keyword fallback if intent == "unknown" ──
+    matches    = state.knowledge_base.search(q, top_k=5)
+    is_medical = (
+        intent == "medical"
+        or MedicalClassifier.is_medical(q, matches)
     )
+
+    if not is_medical:
+        reply, model_used = state.gemini.reply_social(q)
+        return AskResponse(
+            query=q, gemini_reply=reply, model_used=model_used,
+            matches=[], low_confidence=True, is_medical=False,
+            found_in_database=False, disclaimer=MEDICAL_DISCLAIMER, language=language,
+        )
+
+    ctx = QueryContext(
+        raw_query=q, language=language,
+        is_medical=True, matches=matches,
+    )
+
+    # ── Step 3: No reliable matches → honest response ───────────────────
+    if not ctx.has_reliable_matches:
+        reply = state.prompt_builder.get_no_data_response(language)
+        return AskResponse(
+            query=q, gemini_reply=reply, model_used="none",
+            matches=[MatchResult(**m.__dict__) for m in matches],
+            low_confidence=True, is_medical=True, found_in_database=False,
+            disclaimer=MEDICAL_DISCLAIMER, language=language,
+        )
+
+    # ── Step 4: Reliable matches → Strict RAG answer ────────────────────
+    prompt = state.prompt_builder.build(ctx)
+    reply, model_used = state.gemini.generate(prompt)
 
     return AskResponse(
-        status="success",
-        intent="medical",
-        reply=answer,
-        source="rag",
+        query=q, gemini_reply=reply, model_used=model_used,
+        matches=[MatchResult(**m.__dict__) for m in matches],
+        low_confidence=False, is_medical=True, found_in_database=True,
+        disclaimer=MEDICAL_DISCLAIMER, language=language,
     )
-
-
-# ============================================================
-# /analyze-image
-# ============================================================
 
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
-    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type: {file.content_type}. Use JPEG, PNG, or WebP.",
-        )
-
-    try:
-        image_bytes = await file.read()
-
-        if len(image_bytes) > 10 * 1024 * 1024:  # 10 MB limit
-            raise HTTPException(status_code=413, detail="Image too large. Max 10MB.")
-
-        # Encode to base64 — required by Gemini vision API
-        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-        def _call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    {
-                        "inline_data": {
-                            "mime_type": file.content_type,
-                            "data": image_b64,
-                        }
-                    },
-                    {"text": "Analyze this medical image."},
-                ],
-                config={
-                    "temperature": 0.2,
-                    "max_output_tokens": 800,
-                    "system_instruction": VISION_PROMPT,
-                },
-            )
-
-        response = await call_with_retry(_call)
-        raw_text = response.text.strip()
-        status, analysis, technical = parse_vision_response(raw_text)
-
-        return JSONResponse(content={
-            "status": status,
-            "analysis_ar": analysis,
-            "technical_details": technical,
-            "model_used": "gemini-2.5-flash",
-            "disclaimer": DISCLAIMER,
-        })
-
-    except HTTPException:
-        raise
-    except Exception as ex:
-        log.exception(f"Image analysis failed: {ex}")
+    """
+    Analyze a medical image (lab report, prescription, X-ray, etc.)
+    using Gemini Vision. Returns structured analysis or a polite rejection
+    if the image is not medical-related.
+    """
+    # ── Validate content type ───────────────────────────────────────────
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
         return JSONResponse(
-            status_code=500,
+            status_code=400,
             content={
-                "status": "error",
-                "analysis_ar": "حدث خطأ أثناء تحليل الصورة.",
-                "technical_details": str(ex),
-                "model_used": "gemini-2.5-flash",
-                "disclaimer": DISCLAIMER,
+                "status":     "error",
+                "analysis":   f"Unsupported file type '{file.content_type}'. "
+                              "Allowed: JPEG, PNG, WEBP, HEIC.",
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
             },
         )
 
+    # ── Read bytes ──────────────────────────────────────────────────────
+    try:
+        image_bytes = await file.read()
+    except Exception as e:
+        log.error(f"Failed to read uploaded image '{file.filename}': {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status":     "error",
+                "analysis":   "Failed to read the uploaded file.",
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
+            },
+        )
 
-# ============================================================
-# Run
-# ============================================================
+    # ── Validate size ───────────────────────────────────────────────────
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status":     "error",
+                "analysis":   f"File too large. Maximum allowed size is "
+                              f"{MAX_IMAGE_SIZE // (1024 * 1024)}MB.",
+                "model_used": "none",
+                "disclaimer": MEDICAL_DISCLAIMER,
+            },
+        )
 
-if __name__ == "__main__":
-    import uvicorn
+    log.info(f"Analyzing image: {file.filename} ({len(image_bytes) / 1024:.1f} KB, {file.content_type})")
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # ── Analyze via Gemini Vision ───────────────────────────────────────
+    status, analysis, model_used = state.gemini.analyze_image(
+        image_bytes, file.content_type
+    )
+
+    http_status = 503 if status == "error" else 200
+
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "status":     status,
+            "analysis":   analysis,
+            "model_used": model_used,
+            "disclaimer": MEDICAL_DISCLAIMER,
+        },
+    )
+
+
+# ─────────────────────────────────────────────
+# Utility Endpoints
+# ─────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {
+        "status":                   "ok",
+        "version":                  "7.0.0",
+        "cache_size":               state.gemini.cache_size if state.gemini else 0,
+        "min_confidence_threshold": MIN_CONFIDENCE,
+        "image_analysis":           "enabled",
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "name":      "Medical AI Assistant",
+        "version":   "7.0.0",
+        "mode":      "strict-rag + vision",
+        "status":    "running",
+        "endpoints": ["/ask", "/analyze-image", "/health"],
+        "docs":      "/docs",
+    }
