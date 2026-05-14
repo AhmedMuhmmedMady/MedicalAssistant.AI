@@ -13,3 +13,5 @@ typing-extensions==4.12.2
 
 sentence-transformers==3.0.1
 torch>=2.1.0
+
+python-multipart==0.0.9
