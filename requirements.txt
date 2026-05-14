@@ -1,19 +1,28 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-gunicorn>=21.2.0
+# ── Web framework ────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+httptools==0.6.4
+python-multipart==0.0.12
 
+# ── Config ────────────────────────────────────────────────────────
 python-dotenv==1.0.1
-pydantic==2.10.4
+pydantic==2.10.3
 
-google-genai>=0.6.0,<1.0.0
-pinecone>=5.0.0
+# ── Embeddings (CPU-only, 384-dim) ────────────────────────────────
+sentence-transformers==3.3.1
 
-typing-extensions==4.12.2
-python-multipart==0.0.9
+# Torch CPU-only (Railway safe)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu ; platform_system != "Darwin"
+torch==2.5.1     ; platform_system == "Darwin"
 
-sentence-transformers==2.7.0
-transformers==4.41.2
-torch==2.2.2
-scikit-learn==1.5.1
-scipy==1.14.0
+# ── Vector DB ─────────────────────────────────────────────────────
+pinecone==5.4.2
+
+# ── LLM ───────────────────────────────────────────────────────────
+google-genai==1.10.0
+
+# ── Performance / stability (IMPORTANT for Railway) ──────────────
 numpy==1.26.4
+scipy==1.11.4
