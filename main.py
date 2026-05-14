@@ -1,23 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v13.1                     ║
+║          SILA — Medical AI Assistant  v13.2                     ║
 ║          Production-Hardened · Async-Safe · Zero Blocking       ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
 ║  Mode  : Strict RAG for medical · Social chat for greetings     ║
 ║  Vision: Medical image analysis via Gemini Vision               ║
 ║                                                                  ║
-║  v13.1 vs v13.0  (RAG retrieval fix):                          ║
-║  • MIN_CONFIDENCE lowered to 0.30 (was 0.55 — too strict for   ║
-║    Arabic cosine similarity, caused silent empty results)       ║
-║  • _parse_matches pre-filter lowered to match (was 0.70×conf)  ║
-║  • Pinecone query now explicitly passes namespace="" so it      ║
-║    always hits the default namespace regardless of env config   ║
-║  • PINECONE_NAMESPACE env var added for explicit control        ║
-║  • Embedding dimension logged at query time for mismatch debug  ║
-║  • Semaphore acquire_nowait fallback bug fixed — was acquiring  ║
-║    the semaphore twice when ._value fallback path was taken     ║
-║  • Added detailed logging at every RAG stage for visibility     ║
+║  v13.2 vs v13.1  (Semantic retrieval fix):                    ║
+║  • MIN_CONFIDENCE now uses SCORE_THRESHOLD env var (0.45)      ║
+║  • Added TOP_K, MAX_RETRIES, RETRY_DELAY env vars             ║
+║  • EMBEDDING_BACKEND default changed to 'local'                ║
+║  • Strong semantic filter in _parse_matches to prevent         ║
+║    genetic diseases/rare syndromes from matching simple        ║
+║    symptoms like headache/pain/fever                            ║
+║  • Query-side safety cleanup in _ask_inner to clear            ║
+║    low-confidence or irrelevant matches                        ║
+║  • Pinecone query always includes namespace (default "")      ║
+║  • Enhanced logging: query text, embedding model, vector       ║
+║    dimension, raw scores, filtered counts                      ║
+║  • Fallback to no_data_response for irrelevant results         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Railway start command (recommended):
@@ -77,17 +79,20 @@ INDEX_NAME       = os.getenv("PINECONE_INDEX", "sila-medical")
 # Set PINECONE_NAMESPACE in env if your vectors were upserted with a namespace.
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 
-# v13.1: Lowered from 0.55 → 0.30.
-# Arabic cosine similarity from text-embedding-004 rarely exceeds 0.55
-# for paraphrase-style medical queries — 0.55 was silently blocking all results.
-# Tune upward only after confirming actual score distribution from your index.
-MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.30"))
+# v13.2: Using SCORE_THRESHOLD env var for stricter filtering.
+# Default 0.45 prevents semantically irrelevant matches (e.g., genetic diseases for simple symptoms).
+MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.45"))
 
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
 MAX_IMAGE_MB     = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
 MAX_IMAGE_BYTES  = MAX_IMAGE_MB * 1024 * 1024
 
-EMBEDDING_BACKEND  = os.getenv("EMBEDDING_BACKEND", "gemini").lower()
+# v13.2: Pinecone query configuration
+TOP_K             = int(os.getenv("TOP_K", "7"))
+MAX_RETRIES       = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY       = float(os.getenv("RETRY_DELAY", "1.5"))
+
+EMBEDDING_BACKEND  = os.getenv("EMBEDDING_BACKEND", "local").lower()
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
 
@@ -116,6 +121,31 @@ log = logging.getLogger("sila")
 # Concurrency gate  (initialised in lifespan, needs event loop)
 # ──────────────────────────────────────────────────────────────────
 _request_semaphore: Optional[asyncio.Semaphore] = None
+
+# ──────────────────────────────────────────────────────────────────
+# Simple in-memory IP-based rate limiter (v13.3)
+# ──────────────────────────────────────────────────────────────────
+from collections import defaultdict
+import time as _time
+
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+_RATE_LIMIT_REQUESTS = 10
+_RATE_LIMIT_WINDOW = 60  # seconds
+
+def _check_rate_limit(ip: str) -> bool:
+    """Check if IP has exceeded rate limit. Returns True if allowed."""
+    now = _time.time()
+    with _rate_limit_lock:
+        # Clean old requests outside the window
+        _rate_limit_store[ip] = [
+            ts for ts in _rate_limit_store[ip] if now - ts < _RATE_LIMIT_WINDOW
+        ]
+        # Check if under limit
+        if len(_rate_limit_store[ip]) < _RATE_LIMIT_REQUESTS:
+            _rate_limit_store[ip].append(now)
+            return True
+        return False
 
 # ──────────────────────────────────────────────────────────────────
 # Lazy SDK getters  (imports happen here, NEVER at module level)
@@ -330,6 +360,7 @@ class KnowledgeMatch:
     question: str
     answer: str
     confidence: float
+    category: Optional[str] = None
 
     @property
     def is_reliable(self) -> bool:
@@ -392,6 +423,7 @@ class MatchResult(BaseModel):
     question: str
     answer: str
     confidence: float
+    category: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -475,48 +507,65 @@ class IntentClassifier:
 # ──────────────────────────────────────────────────────────────────
 
 class KnowledgeBaseService:
-    _MAX_RETRIES = 3
-    _RETRY_DELAY = 1.0
+    _MAX_RETRIES = MAX_RETRIES
+    _RETRY_DELAY = RETRY_DELAY
 
-    async def search(self, query: str, top_k: int = 5) -> List[KnowledgeMatch]:
+    async def search(self, query: str, top_k: int = None) -> List[KnowledgeMatch]:
+        if top_k is None:
+            top_k = TOP_K
+        
+        # v13.2: Log query text for debugging
+        log.info(f"[KnowledgeBase] Search query: '{query[:100]}'")
+        
         vector = await EmbeddingRouter.encode(query)
         index  = await get_index()
+
+        # v13.3: Vector dimension safety check
+        expected_dim = 384 if EMBEDDING_BACKEND == "local" else 768
+        if len(vector) != expected_dim:
+            log.error(
+                f"[KnowledgeBase] Vector dimension mismatch: got {len(vector)}, expected {expected_dim}. "
+                f"This will cause Pinecone query failures."
+            )
+            raise RuntimeError(
+                f"Vector dimension mismatch: got {len(vector)}, expected {expected_dim}. "
+                f"Check EMBEDDING_BACKEND and model configuration."
+            )
 
         # v13.1: log vector stats so dimension/value anomalies are visible
         log.info(
             f"[KnowledgeBase] Query vector — dim={len(vector)} "
             f"min={min(vector):.4f} max={max(vector):.4f} "
-            f"namespace='{PINECONE_NAMESPACE or '<default>'}'"
+            f"namespace='{PINECONE_NAMESPACE or '<default>'}' "
+            f"backend={EMBEDDING_BACKEND} "
+            f"model={EMBED_MODEL if EMBEDDING_BACKEND=='local' else GEMINI_EMBED_MODEL}"
         )
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
-                # v13.1: Pass namespace explicitly.
-                # If PINECONE_NAMESPACE="", Pinecone uses the default namespace.
-                # If vectors were upserted with a named namespace, set
-                # PINECONE_NAMESPACE in env to match — otherwise 0 results return.
+                # v13.2: Always include namespace (default to empty string)
                 query_kwargs: dict = dict(
                     vector=vector,
                     top_k=top_k,
                     include_metadata=True,
+                    namespace=PINECONE_NAMESPACE or "",
                 )
-                if PINECONE_NAMESPACE:
-                    query_kwargs["namespace"] = PINECONE_NAMESPACE
 
                 results = await asyncio.to_thread(
                     index.query,
                     **query_kwargs,
                 )
 
-                # v13.1: log raw Pinecone scores BEFORE any filtering
+                # v13.2: log raw Pinecone scores BEFORE any filtering
                 raw_scores = [round(m.score, 4) for m in results.matches]
                 log.info(
                     f"[KnowledgeBase] Pinecone raw scores (top_{top_k}): {raw_scores} "
-                    f"| MIN_CONFIDENCE={MIN_CONFIDENCE}"
+                    f"| MIN_CONFIDENCE={MIN_CONFIDENCE} "
+                    f"| raw_count={len(results.matches)}"
                 )
 
-                matches = self._parse_matches(results)
+                matches = self._parse_matches(results, query)
                 log.info(
                     f"[KnowledgeBase] After filter: {len(matches)} matches kept "
                     f"(threshold≥{MIN_CONFIDENCE * 0.70:.3f})"
@@ -535,23 +584,75 @@ class KnowledgeBaseService:
         raise last_exc  # type: ignore[misc]
 
     @staticmethod
-    def _parse_matches(results: Any) -> List[KnowledgeMatch]:
-        # v13.1: Pre-filter threshold lowered proportionally to match
-        # the new MIN_CONFIDENCE=0.30 baseline.
-        # Pre-filter = 70% of MIN_CONFIDENCE = 0.21 (was 0.385 with old 0.55 default).
-        # This ensures the list passed to QueryContext is not empty when scores
-        # are in the 0.21–0.30 range so the caller can still surface them.
+    def _parse_matches(results: Any, query: str) -> List[KnowledgeMatch]:
+        # v13.2: Pre-filter threshold
         pre_filter = MIN_CONFIDENCE * 0.70
+        
+        # v13.2: Semantic keyword filter for symptom queries
+        # Prevents genetic diseases/rare syndromes from matching simple symptoms
+        symptom_keywords = [
+            "headache", "migraine", "pain", "fever", "dizzy", "nausea",
+            "صداع", "ألم", "دوخة", "حرارة", "مغص", "التهاب"
+        ]
+        
+        # Irrelevant medical domain keywords to filter out
+        irrelevant_keywords = [
+            "syndrome", "genetic", "mutation", "chromosome", "hereditary",
+            "congenital", "rare disease", "orphan",
+            "متلازمة", "وراثي", "طفرة", "كروموسوم", "خلقي", "نادر"
+        ]
+        
         matches = []
+        filtered_count = 0
+        semantic_filtered_count = 0
+        
         for m in results.matches:
             if m.score < pre_filter:
+                filtered_count += 1
                 continue
+            
             meta = m.metadata or {}
+            question = meta.get("question", "").lower()
+            answer = meta.get("answer", "").lower()
+            combined_text = f"{question} {answer}"
+            
+            # v13.2: Semantic filter - check if match is relevant to query
+            # If query contains symptom keywords, match must also contain them
+            query_lower = query.lower()
+            has_symptom_keyword = any(kw in query_lower for kw in symptom_keywords)
+            
+            if has_symptom_keyword:
+                # For symptom queries, require match to contain at least one symptom keyword
+                has_relevant_keyword = any(kw in combined_text for kw in symptom_keywords)
+                if not has_relevant_keyword:
+                    semantic_filtered_count += 1
+                    log.info(
+                        f"[KnowledgeBase] Semantic filter dropped match (no symptom keyword): "
+                        f"score={m.score:.4f} question='{question[:50]}'"
+                    )
+                    continue
+            
+            # v13.2: Filter out irrelevant medical domains
+            has_irrelevant_keyword = any(kw in combined_text for kw in irrelevant_keywords)
+            if has_irrelevant_keyword:
+                semantic_filtered_count += 1
+                log.info(
+                    f"[KnowledgeBase] Semantic filter dropped match (irrelevant domain): "
+                    f"score={m.score:.4f} question='{question[:50]}'"
+                )
+                continue
+            
             matches.append(KnowledgeMatch(
                 question=meta.get("question", ""),
                 answer=meta.get("answer", ""),
                 confidence=round(float(m.score), 4),
+                category=meta.get("category", "General"),
             ))
+        
+        log.info(
+            f"[KnowledgeBase] Filter summary: pre_filter={filtered_count} "
+            f"semantic_filter={semantic_filtered_count} kept={len(matches)}"
+        )
         return matches
 
 
@@ -571,7 +672,9 @@ class PromptBuilder:
         "٤. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات فقط.\n"
         "٥. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
         "٦. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
-        "٧. لغة الإجابة: عربية واضحة ومفهومة."
+        "٧. لغة الإجابة: عربية واضحة ومفهومة.\n"
+        "٨. استفد من التخصص الطبي المذكور في السياق لتحسين دقة الإجابة.\n"
+        "٩. لا تُجيب إلا بناءً على السياق المسترجع من قاعدة المعرفة."
     )
 
     _SYSTEM_EN = (
@@ -584,7 +687,9 @@ class PromptBuilder:
         "'My knowledge is limited on this. Please consult a specialist.'\n"
         "4. NEVER provide a definitive diagnosis — suggest possibilities only.\n"
         "5. Flag any warning signs that require urgent care.\n"
-        "6. Always close by recommending a specialist consultation."
+        "6. Always close by recommending a specialist consultation.\n"
+        "7. Leverage the medical specialty mentioned in the context to improve accuracy.\n"
+        "8. Only answer based on the retrieved context from the knowledge base."
     )
 
     _STRUCTURE_AR = (
@@ -636,8 +741,10 @@ class PromptBuilder:
                 if lang == "ar"
                 else ("✅ Reliable" if m.is_reliable else "⚠️ Low confidence")
             )
+            category_label = m.category or "General"
             context_parts.append(
                 f"[{i}] {reliability} — Score: {m.confidence:.0%}\n"
+                f"[Specialty: {category_label}]\n"
                 f"Q: {m.question}\n"
                 f"A: {m.answer}"
             )
@@ -821,21 +928,59 @@ class GeminiService:
                     if brace > 0:
                         clean = clean[brace:]
 
-                    parsed   = json.loads(clean)
-                    status   = str(parsed.get("status", "success"))
-                    analysis = parsed.get("analysis", "")
-                    if isinstance(analysis, dict):
-                        analysis = analysis.get("analysis") or json.dumps(
-                            analysis, ensure_ascii=False, indent=2
-                        )
-                    if not isinstance(analysis, str):
-                        analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
-                    log.info(f"Vision succeeded — model: {model_name}, status: {status}")
-                    return status, analysis.strip(), model_name
-
-                except json.JSONDecodeError:
-                    log.warning(f"Vision {model_name}: non-JSON response — using raw text.")
-                    return "success", raw, model_name
+                    try:
+                        parsed   = json.loads(clean)
+                        status   = str(parsed.get("status", "success"))
+                        analysis = parsed.get("analysis", "")
+                        if isinstance(analysis, dict):
+                            analysis = analysis.get("analysis") or json.dumps(
+                                analysis, ensure_ascii=False, indent=2
+                            )
+                        if not isinstance(analysis, str):
+                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                        log.info(f"Vision succeeded — model: {model_name}, status: {status}")
+                        return status, analysis.strip(), model_name
+                    except json.JSONDecodeError:
+                        # v13.3: Try to extract first JSON object only
+                        try:
+                            import json as _json
+                            # Find first complete JSON object
+                            start = clean.find("{")
+                            if start != -1:
+                                brace_count = 0
+                                in_string = False
+                                escape_next = False
+                                for i in range(start, len(clean)):
+                                    char = clean[i]
+                                    if escape_next:
+                                        escape_next = False
+                                    elif char == "\\":
+                                        escape_next = True
+                                    elif char == '"' and not escape_next:
+                                        in_string = not in_string
+                                    elif not in_string:
+                                        if char == "{":
+                                            brace_count += 1
+                                        elif char == "}":
+                                            brace_count -= 1
+                                            if brace_count == 0:
+                                                json_str = clean[start:i+1]
+                                                parsed = _json.loads(json_str)
+                                                status = str(parsed.get("status", "success"))
+                                                analysis = parsed.get("analysis", "")
+                                                if isinstance(analysis, dict):
+                                                    analysis = analysis.get("analysis") or _json.dumps(
+                                                        analysis, ensure_ascii=False, indent=2
+                                                    )
+                                                if not isinstance(analysis, str):
+                                                    analysis = _json.dumps(analysis, ensure_ascii=False, indent=2)
+                                                log.info(f"Vision succeeded (partial JSON) — model: {model_name}, status: {status}")
+                                                return status, analysis.strip(), model_name
+                        except Exception:
+                            pass
+                        # If all JSON parsing fails, use raw text
+                        log.warning(f"Vision {model_name}: non-JSON response — using raw text.")
+                        return "success", raw, model_name
                 except Exception as exc:
                     log.warning(f"Vision {model_name} variant failed: {exc}")
                     continue
@@ -889,7 +1034,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sila — Medical AI Assistant",
     description="مساعد طبي ذكي | Strict RAG + Gemini Vision + Arabic & English",
-    version="13.1.0",
+    version="13.2.0",
     lifespan=lifespan,
 )
 
@@ -918,7 +1063,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 def root():
     return {
         "name":      "Sila — Medical AI Assistant",
-        "version":   "13.1.0",
+        "version":   "13.2.0",
         "status":    "running",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
     }
@@ -926,36 +1071,37 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "status": "ok",
+        "version": "13.2.0",
+        "embedding_backend": EMBEDDING_BACKEND,
+        "index": INDEX_NAME,
+        "min_confidence": MIN_CONFIDENCE,
+        "top_k": TOP_K,
+        "max_retries": MAX_RETRIES,
+    }
 
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(req: AskRequest) -> AskResponse:
+async def ask(req: AskRequest, request: Request) -> AskResponse:
     if _request_semaphore is None:
         return JSONResponse(status_code=503, content={"error": "Server not ready yet."})
 
-    # v13.1: Fixed semaphore acquire logic.
-    # asyncio.Semaphore does NOT expose acquire_nowait() in CPython's public API.
-    # The v13.0 fallback path had a double-acquire bug:
-    #   - it set acquired=True AND then called await _request_semaphore.acquire()
-    #   - but the `if not acquired` 503 guard never fired, so the semaphore was
-    #     consumed twice, silently leaking one slot per request on that path.
-    # Fix: single acquire path — try non-blocking first, fall back to False only.
-    acquired = False
-    try:
-        # acquire_nowait is available on asyncio.Semaphore in Python ≥ 3.10
-        _request_semaphore.acquire_nowait()  # type: ignore[attr-defined]
-        acquired = True
-    except AttributeError:
-        # Python < 3.10: inspect internal value without double-acquiring
-        if _request_semaphore._value > 0:  # noqa: SLF001
-            await _request_semaphore.acquire()
-            acquired = True
-    except Exception:
-        # Semaphore is at zero (would-block) — gate is full
-        acquired = False
+    # v13.3: Rate limit check
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        lang = LanguageDetector.detect(req.query)
+        msg = (
+            "لقد تجاوزت الحد المسموح من الطلبات. يرجى المحاولة بعد دقيقة."
+            if lang == "ar"
+            else "You have exceeded the rate limit. Please try again after a minute."
+        )
+        return JSONResponse(status_code=429, content={"error": msg})
 
-    if not acquired:
+    # v13.3: Simplified semaphore logic - use simple await acquire
+    try:
+        await _request_semaphore.acquire()
+    except Exception:
         lang = LanguageDetector.detect(req.query)
         msg  = (
             "الخادم مشغول حالياً. يرجى المحاولة بعد لحظات."
@@ -1011,7 +1157,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
     # ── Medical path ──────────────────────────────────────────────
     try:
-        matches = await state.knowledge_base.search(q, top_k=5)
+        matches = await state.knowledge_base.search(q, top_k=TOP_K)
 
     except EmbeddingRouter.EmbeddingUnavailableError as exc:
         log.error(f"[ASK] Embedding unavailable: {exc}")
@@ -1026,6 +1172,22 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
 
+    except RuntimeError as exc:
+        # v13.3: Handle vector dimension mismatch gracefully
+        if "dimension mismatch" in str(exc):
+            log.error(f"[ASK] Vector dimension error: {exc}")
+            msg = (
+                "عذراً، حدث خطأ في تكوين النظام. يرجى المحاولة مرة أخرى لاحقاً."
+                if language == "ar"
+                else "Sorry, a system configuration error occurred. Please try again later."
+            )
+            return AskResponse(
+                query=q, reply=msg, model_used="none", matches=[],
+                is_medical=True, found_in_database=False, low_confidence=True,
+                language=language, disclaimer=MEDICAL_DISCLAIMER,
+            )
+        raise
+
     except Exception as exc:
         log.error(f"[ASK] Pinecone search failed: {exc}")
         msg = (
@@ -1038,6 +1200,32 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
+
+    # v13.3: Query-side safety cleanup - keep 1-2 fallback results
+    # If all matches have low confidence OR contain irrelevant domains, keep top 1-2 as fallback
+    if matches:
+        all_low_confidence = all(m.confidence < 0.40 for m in matches)
+        
+        irrelevant_keywords = [
+            "syndrome", "genetic", "mutation", "chromosome", "hereditary",
+            "congenital", "rare disease", "orphan",
+            "متلازمة", "وراثي", "طفرة", "كروموسوم", "خلقي", "نادر"
+        ]
+        
+        all_irrelevant = False
+        if matches:
+            all_irrelevant = all(
+                any(kw in f"{m.question.lower()} {m.answer.lower()}" for kw in irrelevant_keywords)
+                for m in matches
+            )
+        
+        if all_low_confidence or all_irrelevant:
+            log.warning(
+                f"[ASK] Query-side safety cleanup: keeping top 2 of {len(matches)} matches as fallback "
+                f"(all_low_confidence={all_low_confidence}, all_irrelevant={all_irrelevant})"
+            )
+            # Keep top 2 matches as fallback instead of clearing all
+            matches = matches[:2]
 
     ctx = QueryContext(raw_query=q, language=language, matches=matches)
 

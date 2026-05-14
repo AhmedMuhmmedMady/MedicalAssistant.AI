@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="solve Ram Problems">
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="Improve the Search">
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
@@ -52,7 +52,7 @@
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
-  <component name="RunManager" selected="Python.main">
+  <component name="RunManager" selected="Python.seed_pinecone">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="MedicalAssistant.AI" />
       <option name="ENV_FILES" value="" />
@@ -130,7 +130,7 @@
       <workItem from="1778631078630" duration="1547000" />
       <workItem from="1778661935003" duration="339000" />
       <workItem from="1778662992737" duration="3819000" />
-      <workItem from="1778683649987" duration="31694000" />
+      <workItem from="1778683649987" duration="49216000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -308,7 +308,55 @@
       <option name="project" value="LOCAL" />
       <updated>1778716123528</updated>
     </task>
-    <option name="localTasksCounter" value="23" />
+    <task id="LOCAL-00023" summary="solve Ram Problems with new Updates">
+      <option name="closed" value="true" />
+      <created>1778725016986</created>
+      <option name="number" value="00023" />
+      <option name="presentableId" value="LOCAL-00023" />
+      <option name="project" value="LOCAL" />
+      <updated>1778725016986</updated>
+    </task>
+    <task id="LOCAL-00024" summary="solve Ram Problems with new Updates">
+      <option name="closed" value="true" />
+      <created>1778726060413</created>
+      <option name="number" value="00024" />
+      <option name="presentableId" value="LOCAL-00024" />
+      <option name="project" value="LOCAL" />
+      <updated>1778726060413</updated>
+    </task>
+    <task id="LOCAL-00025" summary="solve Ram Problems with new Updates">
+      <option name="closed" value="true" />
+      <created>1778729839746</created>
+      <option name="number" value="00025" />
+      <option name="presentableId" value="LOCAL-00025" />
+      <option name="project" value="LOCAL" />
+      <updated>1778729839746</updated>
+    </task>
+    <task id="LOCAL-00026" summary="solve Ram Problems with new Updates">
+      <option name="closed" value="true" />
+      <created>1778730410417</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1778730410417</updated>
+    </task>
+    <task id="LOCAL-00027" summary="Pass the Question through Gemini first">
+      <option name="closed" value="true" />
+      <created>1778767581074</created>
+      <option name="number" value="00027" />
+      <option name="presentableId" value="LOCAL-00027" />
+      <option name="project" value="LOCAL" />
+      <updated>1778767581074</updated>
+    </task>
+    <task id="LOCAL-00028" summary="Improve the Search">
+      <option name="closed" value="true" />
+      <created>1778770960495</created>
+      <option name="number" value="00028" />
+      <option name="presentableId" value="LOCAL-00028" />
+      <option name="project" value="LOCAL" />
+      <updated>1778770960495</updated>
+    </task>
+    <option name="localTasksCounter" value="29" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -346,11 +394,14 @@
     <MESSAGE value="More Improvements" />
     <MESSAGE value="Solve requirements.txt" />
     <MESSAGE value="solve Ram Problems" />
-    <option name="LAST_COMMIT_MESSAGE" value="solve Ram Problems" />
+    <MESSAGE value="solve Ram Problems with new Updates" />
+    <MESSAGE value="Pass the Question through Gemini first" />
+    <MESSAGE value="Improve the Search" />
+    <option name="LAST_COMMIT_MESSAGE" value="Improve the Search" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/MedicalAssistant_AI$main.coverage" NAME="main Coverage Results" MODIFIED="1778603392948" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778724884936" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/main_py$seed_pinecone.coverage" NAME="seed_pinecone Coverage Results" MODIFIED="1778700907701" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778775127989" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/main_py$seed_pinecone.coverage" NAME="seed_pinecone Coverage Results" MODIFIED="1778775357863" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
