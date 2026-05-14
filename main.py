@@ -776,13 +776,18 @@ class PromptBuilder:
 
 class GeminiService:
     """
-    Every Gemini call is a *_sync method run via asyncio.to_thread.
-    The event loop is never blocked, even for large model responses.
-    Response cache capped at 200 entries (thread-safe via GIL).
+    v13.1: All Gemini calls are offloaded to threadpool to avoid blocking the event loop.
+    This is critical for Railway deployment where the process must stay responsive.
     """
 
+    # v13.3: Bounded LRU cache (max 200 entries)
+    _cache: dict[str, Tuple[str, str]] = {}
+    _cache_lock = threading.Lock()
+    _cache_max_size = 200
+    _cache_access_order: list[str] = []
+
     def __init__(self) -> None:
-        self._cache: dict[str, Tuple[str, str]] = {}
+        pass
 
     @staticmethod
     def _make_config(temperature: float = 0.2, max_tokens: int = 2048):
@@ -837,9 +842,14 @@ class GeminiService:
 
     def _generate_sync(self, prompt: str) -> Tuple[str, str]:
         cache_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        if cache_key in self._cache:
-            log.info("Cache hit — reusing previous response.")
-            return self._cache[cache_key]
+        with self._cache_lock:
+            if cache_key in self._cache:
+                log.info("Cache hit — reusing previous response.")
+                # Update access order for LRU
+                if cache_key in self._cache_access_order:
+                    self._cache_access_order.remove(cache_key)
+                self._cache_access_order.append(cache_key)
+                return self._cache[cache_key]
 
         for model_name in GEMINI_TEXT_MODELS:
             try:
@@ -850,8 +860,14 @@ class GeminiService:
                     config=self._make_config(),
                 )
                 text = resp.text.strip()
-                if len(self._cache) < 200:
+                with self._cache_lock:
+                    # LRU eviction if cache is full
+                    if len(self._cache) >= self._cache_max_size:
+                        oldest_key = self._cache_access_order.pop(0)
+                        if oldest_key in self._cache:
+                            del self._cache[oldest_key]
                     self._cache[cache_key] = (text, model_name)
+                    self._cache_access_order.append(cache_key)
                 return text, model_name
             except Exception as exc:
                 log.warning(f"RAG generate — {model_name} failed: {exc}")
