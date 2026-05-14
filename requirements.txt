@@ -1,43 +1,34 @@
-# ──────────────────────────────────────────────────────────────────
-# Sila v14.1 — requirements.txt
-# Railway FREE PLAN optimized: minimal, CPU-only, fast cold start
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────
+# SILA v14.2 - Production Stable
+# ─────────────────────────────
 
-# Web framework
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 
-# Pydantic (FastAPI dependency)
 pydantic==2.10.3
-
-# Environment variables
 python-dotenv==1.0.1
 
-# Gemini SDK (google-genai, NOT google-generativeai)
+# Google GenAI (strict compatible)
 google-genai==1.16.0
+anyio>=4.8.0,<5.0.0
 
-# Pinecone v3 client — minimal, no extras
-pinecone==5.4.2
-
-# Sentence Transformers (local embeddings, CPU-only)
-sentence-transformers==3.3.1
-
-# PyTorch CPU-only — avoids CUDA bloat (~200MB vs ~3GB)
-# Install via pip index URL for CPU builds:
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu
-
-# Transformers (required by sentence-transformers)
-transformers==4.47.1
-
-# Tokenizers (required by transformers)
-tokenizers==0.21.0
-
-# NumPy — compatible with torch 2.5.x
-numpy==1.26.4
-
-# HTTP client — google-genai 1.16.0 requires httpx>=0.28.1
+# HTTP layer (required by google-genai)
 httpx>=0.28.1,<1.0.0
 
-# File upload support for FastAPI
+# Pinecone vector DB
+pinecone==5.4.2
+
+# ML stack (keep flexible to avoid conflicts)
+sentence-transformers==3.3.1
+transformers>=4.46.0,<5.0.0
+tokenizers>=0.20.0,<0.22.0
+
+# Torch CPU only (must stay pinned)
+torch==2.5.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy>=1.26.4,<2.0.0
+
 python-multipart==0.0.20
+
+requests==2.32.3

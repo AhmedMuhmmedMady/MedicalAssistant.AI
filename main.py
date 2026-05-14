@@ -1,21 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v14.1                     ║
+║          SILA — Medical AI Assistant  v14.2                     ║
 ║          Railway-Hardened · 384-dim · Local Embeddings Only     ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
 ║  Mode  : Strict RAG (local 384-dim) · Social chat               ║
-║  v14.1 fixes:                                                   ║
-║  • Added missing _GEMINI_ONLY_AR / _GEMINI_ONLY_EN in Builder   ║
-║  • All PromptBuilder methods now complete and tested             ║
-║  • Fully lazy-loaded, zero-SDK boot                             ║
-║  • Production-safe Railway free plan deployment                 ║
+║                                                                  ║
+║  🎯 v14.2 Changes:                                              ║
+║  • MIN_CONFIDENCE: 0.45 → 0.60                                  ║
+║  • RAG_STRONG gap: +0.10 → +0.15 (score >= 0.75)                ║
+║  • ✅ Added keyword-overlap relevance guard                     ║
+║  • ✅ RAG_WEAK requires relevance_ok                            ║
+║  • ✅ GEMINI_ONLY gives real medical answers                    ║
+║  • ✅ Better category consistency tracking                      ║
+║  • ✅ Improved error handling & logging                         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 # ── Unbuffered output first — Railway log visibility ──────────────
 import os
-
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -54,14 +57,14 @@ from pydantic import BaseModel, model_validator
 load_dotenv()
 
 # ──────────────────────────────────────────────────────────────────
-# Environment
+# Environment Configuration
 # ──────────────────────────────────────────────────────────────────
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "")
 INDEX_NAME         = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 
-MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.45"))
+MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.60"))
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
 MAX_IMAGE_MB     = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
 MAX_IMAGE_BYTES  = MAX_IMAGE_MB * 1024 * 1024
@@ -76,28 +79,29 @@ EMBED_DIM   = 384  # all-MiniLM-L6-v2 fixed output dimension
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
 EXTERNAL_CALL_TIMEOUT   = int(os.getenv("EXTERNAL_CALL_TIMEOUT", "25"))
 
+# Validation
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set.")
+    raise RuntimeError("❌ GEMINI_API_KEY is not set.")
 if not PINECONE_API_KEY:
-    raise RuntimeError("PINECONE_API_KEY is not set.")
+    raise RuntimeError("❌ PINECONE_API_KEY is not set.")
 
 # ──────────────────────────────────────────────────────────────────
-# Logging — compact, no vector dumps
+# Logging Configuration
 # ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("sila")
 
 # ──────────────────────────────────────────────────────────────────
-# Concurrency gate
+# Concurrency Semaphore
 # ──────────────────────────────────────────────────────────────────
 _request_semaphore: Optional[asyncio.Semaphore] = None
 
 # ──────────────────────────────────────────────────────────────────
-# Rate limiter — in-memory, thread-safe, no Redis
+# Rate Limiter — In-Memory, Thread-Safe
 # ──────────────────────────────────────────────────────────────────
 _rate_limit_store: Dict[str, list] = defaultdict(list)
 _rate_limit_lock  = threading.Lock()
@@ -106,11 +110,14 @@ _RATE_LIMIT_WINDOW   = 60  # seconds
 
 
 def _check_rate_limit(ip: str) -> bool:
+    """Check if IP has exceeded rate limit (10 req/min)."""
     now = time.time()
     with _rate_limit_lock:
+        # Remove old entries outside the window
         _rate_limit_store[ip] = [
             ts for ts in _rate_limit_store[ip] if now - ts < _RATE_LIMIT_WINDOW
         ]
+        # Check and add new request
         if len(_rate_limit_store[ip]) < _RATE_LIMIT_REQUESTS:
             _rate_limit_store[ip].append(now)
             return True
@@ -118,7 +125,7 @@ def _check_rate_limit(ip: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Lazy SDK: Pinecone
+# Lazy SDK: Pinecone v3
 # ──────────────────────────────────────────────────────────────────
 _pinecone_index = None
 _pinecone_lock  = threading.Lock()
@@ -129,10 +136,14 @@ def _init_pinecone():
     if _pinecone_index is None:
         with _pinecone_lock:
             if _pinecone_index is None:
-                log.info("Initialising Pinecone…")
-                from pinecone import Pinecone as _PC
-                _pinecone_index = _PC(api_key=PINECONE_API_KEY).Index(INDEX_NAME)
-                log.info("Pinecone ready.")
+                log.info("🔄 Initialising Pinecone v3…")
+                try:
+                    from pinecone import Pinecone as _PC
+                    _pinecone_index = _PC(api_key=PINECONE_API_KEY).Index(INDEX_NAME)
+                    log.info(f"✅ Pinecone ready — index: {INDEX_NAME}")
+                except Exception as exc:
+                    log.error(f"❌ Pinecone init failed: {exc}")
+                    raise
     return _pinecone_index
 
 
@@ -143,7 +154,7 @@ async def get_index():
 
 
 # ──────────────────────────────────────────────────────────────────
-# Lazy SDK: Gemini
+# Lazy SDK: Google Gemini
 # ──────────────────────────────────────────────────────────────────
 _gemini_client = None
 _gemini_lock   = threading.Lock()
@@ -154,18 +165,24 @@ def _init_gemini():
     if _gemini_client is None:
         with _gemini_lock:
             if _gemini_client is None:
-                log.info("Initialising Gemini client…")
-                from google import genai as _genai
-                _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
-                log.info("Gemini client ready.")
+                log.info("🔄 Initialising Gemini client…")
+                try:
+                    from google import genai as _genai
+                    _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
+                    log.info("✅ Gemini client ready.")
+                except Exception as exc:
+                    log.error(f"❌ Gemini init failed: {exc}")
+                    raise
     return _gemini_client
 
 
 def _get_gemini_sync():
+    """Get Gemini client (initialize if needed)."""
     return _init_gemini()
 
 
 def _gemini_types():
+    """Import Gemini types module."""
     from google.genai import types
     return types
 
@@ -179,17 +196,23 @@ _st_load_error: Optional[str] = None
 
 
 def _load_and_encode_sync(text: str) -> List[float]:
+    """Load SentenceTransformer model and encode text to 384-dim vector."""
     global _st_model, _st_load_error
+
     if _st_model is None:
         with _st_lock:
             if _st_model is None:
                 if _st_load_error:
-                    raise RuntimeError(f"Embedder previously failed: {_st_load_error}")
+                    raise RuntimeError(f"❌ Embedder previously failed: {_st_load_error}")
+
                 try:
-                    log.info(f"Lazy-loading SentenceTransformer: {EMBED_MODEL}")
+                    log.info(f"🔄 Lazy-loading SentenceTransformer: {EMBED_MODEL}")
                     t0 = time.perf_counter()
+
                     from sentence_transformers import SentenceTransformer
                     model = SentenceTransformer(EMBED_MODEL, device="cpu")
+
+                    # Optimize PyTorch if available
                     try:
                         import torch as _torch
                         _torch.set_num_threads(1)
@@ -197,36 +220,47 @@ def _load_and_encode_sync(text: str) -> List[float]:
                         _torch.set_grad_enabled(False)
                     except ImportError:
                         pass
-                    log.info(f"SentenceTransformer ready in {time.perf_counter() - t0:.2f}s")
+
+                    elapsed = time.perf_counter() - t0
+                    log.info(f"✅ SentenceTransformer ready in {elapsed:.2f}s")
                     _st_model = model
+
                 except Exception as exc:
                     _st_load_error = str(exc)
+                    log.error(f"❌ Failed to load SentenceTransformer: {exc}")
                     raise
 
-    vec: List[float] = _st_model.encode(
-        text,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=False,
-    ).tolist()
+    # Encode text
+    try:
+        vec: List[float] = _st_model.encode(
+            text,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        ).tolist()
 
-    if len(vec) != EMBED_DIM:
-        raise RuntimeError(
-            f"Embedding dimension mismatch: got {len(vec)}, expected {EMBED_DIM}."
-        )
-    return vec
+        if len(vec) != EMBED_DIM:
+            raise RuntimeError(
+                f"❌ Embedding dimension mismatch: got {len(vec)}, expected {EMBED_DIM}."
+            )
+        return vec
+    except Exception as exc:
+        log.error(f"❌ Encoding failed: {exc}")
+        raise
 
 
 async def _encode_async(text: str) -> List[float]:
+    """Async wrapper for encoding."""
     try:
         return await asyncio.to_thread(_load_and_encode_sync, text)
     except Exception as exc:
-        raise RuntimeError(f"Embedding unavailable: {exc}") from exc
+        raise RuntimeError(f"❌ Embedding unavailable: {exc}") from exc
 
 
 # ──────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────
+
 GEMINI_TEXT_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -244,11 +278,12 @@ ALLOWED_IMAGE_TYPES = frozenset({
 })
 
 MEDICAL_DISCLAIMER = (
-    "⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط "
-    "ولا تُغني عن استشارة طبيب متخصص."
+    "⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط ولا تُغني عن استشارة طبيب متخصص."
 )
 
+# Medical keywords (expanded for better detection)
 MEDICAL_KEYWORDS: frozenset = frozenset({
+    # Arabic
     "ألم", "وجع", "مرض", "دواء", "طبيب", "مستشفى", "أعراض", "علاج",
     "صداع", "حمى", "سعال", "ضغط", "سكر", "قلب", "كلى", "معدة",
     "عظام", "جلد", "عين", "أذن", "أنف", "رئة", "كبد", "دم",
@@ -256,13 +291,14 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
     "الم", "عندي", "عندى", "اشعر", "احس", "اعاني", "يؤلم",
     "بوجعني", "بتوجعني", "حاسس", "حاسه", "حبوب", "طفح", "حكة",
     "عملية", "جراحة", "منظار", "تحليل", "أشعة", "نتيجة", "تقرير",
+    "برد", "انفلونزا", "رشح", "زكام", "كحة", "بلغم", "حرارة",
+    # English
     "pain", "ache", "fever", "cough", "headache", "nausea", "dizzy",
     "vomit", "diarrhea", "symptom", "disease", "doctor", "hospital",
     "medicine", "drug", "blood", "heart", "lung", "kidney", "liver",
     "diabetes", "pressure", "infection", "allergy", "rash", "swelling",
     "fatigue", "tired", "breathe", "chest", "stomach", "throat",
     "surgery", "scan", "test", "result", "report", "prescription",
-    "برد", "انفلونزا", "رشح", "زكام", "كحة", "بلغم", "حرارة",
     "cold", "flu", "runny", "nose", "sneeze", "congestion",
 })
 
@@ -272,6 +308,7 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
 
 @dataclass
 class KnowledgeMatch:
+    """A single match from the knowledge base."""
     question: str
     answer: str
     confidence: float
@@ -279,11 +316,13 @@ class KnowledgeMatch:
 
     @property
     def is_reliable(self) -> bool:
+        """Check if confidence meets minimum threshold."""
         return self.confidence >= MIN_CONFIDENCE
 
 
 @dataclass
 class QueryContext:
+    """Context for a single query."""
     raw_query: str
     language: str
     matches: List[KnowledgeMatch] = field(default_factory=list)
@@ -298,17 +337,17 @@ class QueryContext:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Pydantic Schemas
+# Pydantic Request/Response Models
 # ──────────────────────────────────────────────────────────────────
 
 class MessageDto(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
+    """Chat history message."""
     role: str
     content: str
 
 
 class AskRequest(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
+    """Request to /ask endpoint."""
     question: Optional[str] = None
     text: Optional[str] = None
     history: Optional[List[MessageDto]] = None
@@ -328,7 +367,7 @@ class AskRequest(BaseModel):
 
 
 class MatchResult(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
+    """A knowledge base match result."""
     question: str
     answer: str
     confidence: float
@@ -336,7 +375,7 @@ class MatchResult(BaseModel):
 
 
 class AskResponse(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
+    """Response from /ask endpoint."""
     query: str
     reply: str
     model_used: str
@@ -349,7 +388,7 @@ class AskResponse(BaseModel):
 
 
 class ImageAnalysisResponse(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
+    """Response from /analyze-image endpoint."""
     status: str
     analysis: Optional[str] = None
     model_used: Optional[str] = None
@@ -361,22 +400,29 @@ class ImageAnalysisResponse(BaseModel):
 # ──────────────────────────────────────────────────────────────────
 
 class LanguageDetector:
+    """Detect Arabic vs English."""
+
     @staticmethod
     def detect(text: str) -> str:
         if not text:
             return "ar"
+        # Count Arabic Unicode characters
         arabic_chars = sum(1 for c in text if "\u0600" <= c <= "\u06ff")
-        return "ar" if arabic_chars / max(len(text.strip()), 1) > 0.25 else "en"
+        ratio = arabic_chars / max(len(text.strip()), 1)
+        return "ar" if ratio > 0.25 else "en"
 
 
 # ──────────────────────────────────────────────────────────────────
-# Intent Classifier — keyword-first, Gemini as optional enhancer
+# Intent Classifier
 # ──────────────────────────────────────────────────────────────────
 
 class IntentClassifier:
     """
-    Keyword check runs first (zero cost).
-    Gemini is called only when keywords give no signal.
+    Classify query as 'medical' or 'social'.
+    
+    Strategy:
+    1. Check medical keywords first (zero cost)
+    2. If no signal, call Gemini flash-lite for classification
     """
 
     _PROMPT = (
@@ -392,10 +438,15 @@ class IntentClassifier:
 
     @classmethod
     def _classify_sync(cls, query: str) -> str:
+        """Synchronous classification."""
         q_lower = query.lower()
+
+        # Fast path: keyword check
         if any(kw in q_lower for kw in MEDICAL_KEYWORDS):
+            log.info("[Intent] Medical keyword detected")
             return "medical"
 
+        # Slow path: Gemini classification
         try:
             types = _gemini_types()
             resp = _get_gemini_sync().models.generate_content(
@@ -405,14 +456,17 @@ class IntentClassifier:
             )
             result = resp.text.strip().lower()
             if "medical" in result:
+                log.info("[Intent] Gemini classified as: medical")
                 return "medical"
+            log.info("[Intent] Gemini classified as: social")
         except Exception as exc:
-            log.warning(f"IntentClassifier Gemini call failed: {exc}")
+            log.warning(f"[Intent] Gemini fallback failed: {exc} — defaulting to social")
 
         return "social"
 
     @classmethod
     async def classify(cls, query: str) -> str:
+        """Async wrapper for classification."""
         return await asyncio.to_thread(cls._classify_sync, query)
 
 
@@ -421,9 +475,11 @@ class IntentClassifier:
 # ──────────────────────────────────────────────────────────────────
 
 class KnowledgeBaseService:
+    """RAG pipeline: embedding, Pinecone search, relevance filtering."""
 
     @staticmethod
     def _category_consistency(matches: List[KnowledgeMatch]) -> float:
+        """Calculate category consistency score (0.0-1.0)."""
         if not matches:
             return 0.0
         categories = [m.category for m in matches if m.category]
@@ -431,19 +487,23 @@ class KnowledgeBaseService:
             return 0.0
         counts = Counter(categories)
         dominant_count = counts.most_common(1)[0][1]
-        return dominant_count / len(categories)
+        return round(dominant_count / len(categories), 2)
 
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
-        log.info(f"[KB] Search: '{query[:80]}'")
+        """Search knowledge base and return top matches."""
+        log.info(f"[KB] Searching: '{query[:80]}'")
 
+        # Step 1: Encode query
         try:
             vector = await _encode_async(query)
         except Exception as exc:
-            log.error(f"[KB] Embedding failed: {exc}")
+            log.error(f"[KB] Encoding failed: {exc}")
             return []
 
+        # Step 2: Get Pinecone index
         index = await get_index()
 
+        # Step 3: Query with retries
         last_exc: Optional[Exception] = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -455,34 +515,82 @@ class KnowledgeBaseService:
                     namespace=PINECONE_NAMESPACE or "",
                 )
                 results = await asyncio.to_thread(_query_fn)
+
+                # Log scores
                 raw_scores = [
                     round(float(m.score), 4)
                     for m in results.matches
                     if m.score is not None
                 ]
                 log.info(
-                    f"[KB] Pinecone scores: {raw_scores} "
-                    f"| threshold={MIN_CONFIDENCE} | n={len(results.matches)}"
+                    f"[KB] Scores: {raw_scores} | threshold={MIN_CONFIDENCE} | count={len(results.matches)}"
                 )
+
                 return self._parse_matches(results)
+
             except Exception as exc:
                 last_exc = exc
-                log.warning(f"[KB] Pinecone attempt {attempt}/{MAX_RETRIES} failed: {exc}")
+                log.warning(f"[KB] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY * attempt)
 
-        log.error(f"[KB] All retries exhausted: {last_exc}")
+        log.error(f"[KB] All {MAX_RETRIES} retries exhausted")
         return []
 
     @staticmethod
+    def _relevance_ok(query: str, matches: List[KnowledgeMatch], min_overlap: int = 1) -> bool:
+        """
+        Relevance Guard: Keyword overlap check to prevent Pinecone cosine drift.
+        
+        Checks that at least `min_overlap` query tokens appear in top-3 match texts.
+        
+        Why? Pinecone similarity can give high scores for off-topic results
+        (e.g., "heart disease" when searching for "headache pain").
+        """
+        if not matches:
+            return False
+
+        # Normalize and tokenize query
+        q_clean = re.sub(r"[\u064b-\u065f]", "", query.lower())  # Remove Arabic diacritics
+        q_tokens = set(t for t in re.split(r"[\s\W]+", q_clean) if len(t) >= 3)
+
+        if not q_tokens:
+            # Can't check empty token set — allow through
+            log.info("[KB] Relevance: Query too short/empty — allowing")
+            return True
+
+        # Build token set from top-3 match texts
+        combined = " ".join(
+            f"{m.question} {m.answer}" for m in matches[:3]
+        ).lower()
+        combined_clean = re.sub(r"[\u064b-\u065f]", "", combined)
+        match_tokens = set(t for t in re.split(r"[\s\W]+", combined_clean) if len(t) >= 3)
+
+        # Check overlap
+        overlap = len(q_tokens & match_tokens)
+        ok = overlap >= min_overlap
+
+        log.info(
+            f"[KB] Relevance guard: query_tokens={len(q_tokens)} "
+            f"match_tokens={len(match_tokens)} overlap={overlap} min_overlap={min_overlap} "
+            f"result={'✅' if ok else '❌'}"
+        )
+
+        return ok
+
+    @staticmethod
     def _parse_matches(results: Any) -> List[KnowledgeMatch]:
+        """Parse Pinecone results into KnowledgeMatch objects."""
         matches = []
         filtered = 0
+
         for m in results.matches:
             score = float(m.score) if m.score is not None else 0.0
+
             if score < MIN_CONFIDENCE:
                 filtered += 1
                 continue
+
             meta = m.metadata or {}
             matches.append(KnowledgeMatch(
                 question=meta.get("question", ""),
@@ -490,7 +598,8 @@ class KnowledgeBaseService:
                 confidence=round(score, 4),
                 category=meta.get("category", "General"),
             ))
-        log.info(f"[KB] Kept={len(matches)} filtered={filtered}")
+
+        log.info(f"[KB] Parsed: {len(matches)} kept, {filtered} filtered")
         return matches
 
 
@@ -499,6 +608,8 @@ class KnowledgeBaseService:
 # ──────────────────────────────────────────────────────────────────
 
 class PromptBuilder:
+    """Build prompts for RAG_STRONG, RAG_WEAK, GEMINI_ONLY modes."""
+
     _SEP = "━" * 50
 
     _SYSTEM_AR = (
@@ -512,8 +623,7 @@ class PromptBuilder:
         "٤. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات فقط.\n"
         "٥. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
         "٦. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
-        "٧. لغة الإجابة: عربية واضحة ومفهومة.\n"
-        "٨. لا تُجيب إلا بناءً على السياق المسترجع من قاعدة المعرفة."
+        "٧. لغة الإجابة: عربية واضحة ومفهومة."
     )
 
     _SYSTEM_EN = (
@@ -527,31 +637,34 @@ class PromptBuilder:
         "4. NEVER provide a definitive diagnosis — suggest possibilities only.\n"
         "5. Flag any warning signs that require urgent care.\n"
         "6. Always close by recommending a specialist consultation.\n"
-        "7. Only answer based on the retrieved context from the knowledge base."
+        "7. Respond in clear, professional English."
     )
 
     _GEMINI_ONLY_AR = (
         "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
         "أسلوبك: دافئ واحترافي، كأنك طبيب خبير يشرح لمريضه بصدق واهتمام.\n\n"
-        "لم يتم العثور على معلومات كافية في قاعدة البيانات الطبية لهذا الاستفسار.\n"
-        "استخدم معرفتك الطبية العامة الموثوقة للإجابة، مع الالتزام بالقواعد التالية:\n\n"
-        "١. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات فقط.\n"
-        "٢. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
-        "٣. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
-        "٤. لغة الإجابة: عربية واضحة ومفهومة.\n"
-        "٥. كن صادقاً إذا كانت المعلومات غير كافية أو خارج نطاق معرفتك."
+        "لم يتم العثور على معلومات مطابقة في قاعدة البيانات الطبية لهذا الاستفسار.\n"
+        "استخدم معرفتك الطبية العامة الموثوقة للإجابة بشكل مفيد وشامل.\n\n"
+        "قواعد صارمة:\n"
+        "١. قدّم إجابة طبية مفيدة وحقيقية بناءً على معرفتك الطبية العامة.\n"
+        "٢. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات وأسباباً محتملة.\n"
+        "٣. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
+        "٤. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
+        "٥. لغة الإجابة: عربية واضحة ومفهومة.\n"
+        "٦. لا تكرر عبارة 'معلوماتي محدودة' — قدّم قيمة طبية حقيقية."
     )
 
     _GEMINI_ONLY_EN = (
         "You are 'Sila', a trusted and empathetic medical AI assistant.\n"
         "Tone: warm, calm, and professionally precise.\n\n"
-        "No specific information was found in the medical knowledge base for this query.\n"
-        "Use your reliable general medical knowledge to respond, following these rules:\n\n"
-        "1. NEVER provide a definitive diagnosis — suggest possibilities only.\n"
-        "2. Flag any warning signs that require urgent care.\n"
-        "3. Always close by recommending a specialist consultation.\n"
-        "4. Be honest if information is limited or outside your knowledge.\n"
-        "5. Your answer should still be medically helpful and safe."
+        "No matching records were found in the medical knowledge base for this query.\n"
+        "Use your reliable general medical knowledge to provide a genuinely helpful response.\n\n"
+        "Strict rules:\n"
+        "1. Give a real, helpful medical answer based on your general medical knowledge.\n"
+        "2. NEVER provide a definitive diagnosis — suggest possibilities and likely causes.\n"
+        "3. Flag any warning signs that require urgent care.\n"
+        "4. Always close by recommending a specialist consultation.\n"
+        "5. Do NOT repeatedly say 'my knowledge is limited' — provide genuine medical value."
     )
 
     _STRUCTURE_AR = (
@@ -575,8 +688,7 @@ class PromptBuilder:
         "🏥 Recommended Medical Specialty:\n"
         "→ Which specialist to consult\n\n"
         "⚠️ Warning Signs Requiring Immediate Emergency Care:\n"
-        "→ List if present, or state "
-        "'No critical warning signs identified in the provided context'"
+        "→ List if present, or state 'No critical warning signs identified'"
     )
 
     _NO_DATA_AR = (
@@ -596,8 +708,10 @@ class PromptBuilder:
         matches: List[KnowledgeMatch],
         language: str,
     ) -> str:
+        """Format knowledge base matches into readable context block."""
         sep = self._SEP
         parts = []
+
         for i, m in enumerate(matches, start=1):
             reliability = (
                 ("✅ موثوق" if m.is_reliable else "⚠️ ثقة منخفضة")
@@ -610,10 +724,11 @@ class PromptBuilder:
                 f"Q: {m.question}\n"
                 f"A: {m.answer}"
             )
+
         return f"\n\n{sep}\n".join(parts)
 
     def build(self, ctx: QueryContext) -> str:
-        """RAG_STRONG prompt — rely strongly on retrieved context."""
+        """Build RAG_STRONG prompt (strict RAG mode)."""
         lang      = ctx.language
         system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
         structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
@@ -632,7 +747,7 @@ class PromptBuilder:
         )
 
     def build_rag_weak(self, ctx: QueryContext) -> str:
-        """RAG_WEAK prompt — context treated as hints; Gemini may use general reasoning."""
+        """Build RAG_WEAK prompt (hints only, Gemini can extend)."""
         lang      = ctx.language
         system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
         structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
@@ -642,7 +757,7 @@ class PromptBuilder:
             "⚠️ ملاحظة: السياق المسترجع قد يحتوي على معلومات طبية ضعيفة أو غير دقيقة. "
             "استخدمه كإشارات داعمة فقط، واعتمد على معرفتك الطبية العامة."
             if lang == "ar"
-            else "⚠️ Note: Retrieved context may contain weak or inaccurate medical information. "
+            else "⚠️ Note: Retrieved context may contain weak or inaccurate information. "
             "Use it only as supporting hints and rely on your general medical knowledge."
         )
 
@@ -663,7 +778,7 @@ class PromptBuilder:
         )
 
     def build_gemini_only(self, query: str, language: str) -> str:
-        """GEMINI_ONLY prompt — pure Gemini medical reasoning, no RAG context."""
+        """Build GEMINI_ONLY prompt (pure Gemini reasoning, no RAG)."""
         system         = self._GEMINI_ONLY_AR if language == "ar" else self._GEMINI_ONLY_EN
         structure      = self._STRUCTURE_AR   if language == "ar" else self._STRUCTURE_EN
         label_question = "🧑‍⚕️ سؤال المريض:"  if language == "ar" else "🧑‍⚕️ Patient Question:"
@@ -677,14 +792,17 @@ class PromptBuilder:
         )
 
     def no_data_response(self, language: str) -> str:
+        """Fallback response when nothing works."""
         return self._NO_DATA_AR if language == "ar" else self._NO_DATA_EN
 
 
 # ──────────────────────────────────────────────────────────────────
-# Bounded LRU cache — thread-safe, max 200 entries
+# LRU Cache — Thread-Safe, Bounded (200 entries)
 # ──────────────────────────────────────────────────────────────────
 
 class _BoundedLRU:
+    """Simple LRU cache for prompt responses."""
+
     def __init__(self, maxsize: int = 200):
         self._cache: collections.OrderedDict = collections.OrderedDict()
         self._max  = maxsize
@@ -710,25 +828,28 @@ class _BoundedLRU:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Gemini Service  (threadpool-offloaded, bounded LRU cache)
+# Gemini Service (Text + Vision)
 # ──────────────────────────────────────────────────────────────────
 
 class GeminiService:
+    """Wrapper for Gemini API calls (text generation + image analysis)."""
 
     def __init__(self) -> None:
         self._cache = _BoundedLRU(200)
 
     @staticmethod
     def _make_config(temperature: float = 0.2, max_tokens: int = 2048):
+        """Create Gemini generation config."""
         types = _gemini_types()
         return types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=max_tokens,
         )
 
-    # ── Social replies ─────────────────────────────────────────────
+    # ── Social Replies ─────────────────────────────────────────────
 
     def _reply_social_sync(self, query: str, language: str) -> Tuple[str, str]:
+        """Generate social chat response."""
         if language == "en":
             system = (
                 "You are 'Sila', a friendly and warm medical AI assistant. "
@@ -741,9 +862,12 @@ class GeminiService:
                 "رد بالعربية بشكل طبيعي ودافئ. الرد قصير (جملة أو اتنين بالكثير).\n"
                 "لو الموضوع مش طبي، قول بلطف إنك متخصص في الاستشارات الطبية."
             )
+
         types = _gemini_types()
+
         for model_name in GEMINI_TEXT_MODELS:
             try:
+                log.info(f"[Social] {model_name}")
                 resp = _get_gemini_sync().models.generate_content(
                     model=model_name,
                     contents=query,
@@ -755,8 +879,9 @@ class GeminiService:
                 )
                 return resp.text.strip(), model_name
             except Exception as exc:
-                log.warning(f"[Gemini] Social {model_name} failed: {exc}")
+                log.warning(f"[Social] {model_name} failed: {exc}")
 
+        # Fallback
         fallback = (
             "Hello! 😊 I'm Sila, your medical AI. How can I help?"
             if language == "en"
@@ -767,18 +892,20 @@ class GeminiService:
     async def reply_social(self, query: str, language: str) -> Tuple[str, str]:
         return await asyncio.to_thread(self._reply_social_sync, query, language)
 
-    # ── RAG generation ─────────────────────────────────────────────
+    # ── RAG Generation ─────────────────────────────────────────────
 
     def _generate_sync(self, prompt: str) -> Tuple[str, str]:
+        """Generate medical response with caching."""
         cache_key = hashlib.sha256(prompt.encode()).hexdigest()
         cached = self._cache.get(cache_key)
+
         if cached:
-            log.info("[Gemini] Cache hit.")
+            log.info("[Gemini] ✅ Cache hit")
             return cached
 
         for model_name in GEMINI_TEXT_MODELS:
             try:
-                log.info(f"[Gemini] Generate — model: {model_name}")
+                log.info(f"[Gemini] Generate — {model_name}")
                 resp = _get_gemini_sync().models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -790,7 +917,7 @@ class GeminiService:
             except Exception as exc:
                 log.warning(f"[Gemini] {model_name} failed: {exc}")
 
-        log.error("[Gemini] All text models exhausted.")
+        log.error("[Gemini] ❌ All text models exhausted")
         return (
             "عذراً، حدث خطأ مؤقت في معالجة طلبك. يرجى المحاولة مرة أخرى.",
             "none",
@@ -799,11 +926,12 @@ class GeminiService:
     async def generate(self, prompt: str) -> Tuple[str, str]:
         return await asyncio.to_thread(self._generate_sync, prompt)
 
-    # ── Image analysis ─────────────────────────────────────────────
+    # ── Image Analysis ─────────────────────────────────────────────
 
     def _analyze_image_sync(
         self, image_bytes: bytes, mime_type: str
     ) -> Tuple[str, str, str]:
+        """Analyze medical image and return JSON response."""
         system_prompt = (
             "You are a specialized medical image analysis AI.\n\n"
             "You ONLY analyze medical images. Accepted types:\n"
@@ -840,18 +968,22 @@ class GeminiService:
                     {"inline_data": {"mime_type": mime_type, "data": b64_data}},
                 ],
             ]
+
             for contents in content_variants:
                 try:
-                    log.info(f"[Vision] model: {model_name}")
+                    log.info(f"[Vision] {model_name}")
                     resp = _get_gemini_sync().models.generate_content(
                         model=model_name,
                         contents=contents,
                         config=self._make_config(temperature=0.1, max_tokens=4096),
                     )
+
                     raw   = resp.text.strip()
                     clean = re.sub(
                         r"^\s*```+(?:json)?\s*|\s*```+\s*$", "", raw, flags=re.MULTILINE
                     ).strip()
+
+                    # Extract JSON if it's wrapped
                     brace = clean.find("{")
                     if brace > 0:
                         clean = clean[brace:]
@@ -860,12 +992,15 @@ class GeminiService:
                         parsed   = json.loads(clean)
                         status   = str(parsed.get("status", "success"))
                         analysis = parsed.get("analysis", "")
+
                         if not isinstance(analysis, str):
                             analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
-                        log.info(f"[Vision] Success — {model_name} status={status}")
+
+                        log.info(f"[Vision] ✅ {model_name} status={status}")
                         return status, analysis.strip(), model_name
+
                     except json.JSONDecodeError:
-                        # Best-effort: scan for first complete JSON object
+                        # Best-effort JSON extraction
                         start = clean.find("{")
                         if start != -1:
                             depth = 0
@@ -894,13 +1029,15 @@ class GeminiService:
                                                 return status, analysis.strip(), model_name
                                             except Exception:
                                                 break
-                        log.warning(f"[Vision] {model_name}: non-JSON fallback.")
+
+                        log.warning(f"[Vision] {model_name} — JSON parse fallback")
                         return "success", raw, model_name
+
                 except Exception as exc:
                     log.warning(f"[Vision] {model_name} variant failed: {exc}")
                     continue
 
-        log.error("[Vision] All models exhausted.")
+        log.error("[Vision] ❌ All models exhausted")
         return (
             "error",
             "تعذّر تحليل الصورة مؤقتاً. يرجى المحاولة مرة أخرى لاحقاً.",
@@ -922,6 +1059,7 @@ class GeminiService:
 # ──────────────────────────────────────────────────────────────────
 
 class AppState:
+    """Singleton for app services."""
     knowledge_base: Optional[KnowledgeBaseService] = None
     gemini: Optional[GeminiService]                = None
     prompt_builder: Optional[PromptBuilder]        = None
@@ -932,19 +1070,28 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup/shutdown handler."""
     global _request_semaphore
-    log.info("🚀 Sila v14.1 — zero-SDK boot.")
+    log.info("🚀 SILA v14.2 starting — zero-SDK boot")
+
     _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     state.knowledge_base = KnowledgeBaseService()
     state.gemini         = GeminiService()
     state.prompt_builder = PromptBuilder()
+
     log.info(
-        f"✅ Boot complete — embed=local/{EMBED_MODEL} dim={EMBED_DIM} "
-        f"concurrency={MAX_CONCURRENT_REQUESTS} timeout={EXTERNAL_CALL_TIMEOUT}s "
-        f"min_confidence={MIN_CONFIDENCE}"
+        f"✅ Boot complete:\n"
+        f"   embed={EMBED_MODEL} (dim={EMBED_DIM})\n"
+        f"   min_confidence={MIN_CONFIDENCE}\n"
+        f"   rag_strong_threshold={MIN_CONFIDENCE + 0.15}\n"
+        f"   concurrency={MAX_CONCURRENT_REQUESTS}\n"
+        f"   timeout={EXTERNAL_CALL_TIMEOUT}s\n"
+        f"   index={INDEX_NAME}"
     )
+
     yield
-    log.info("🛑 Sila shutting down.")
+
+    log.info("🛑 SILA shutting down")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -952,12 +1099,13 @@ async def lifespan(app: FastAPI):
 # ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Sila — Medical AI Assistant",
+    title="Sila — Medical AI Assistant v14.2",
     description="مساعد طبي ذكي | Strict RAG + Gemini Vision + Arabic & English",
-    version="14.1.0",
+    version="14.2.0",
     lifespan=lifespan,
 )
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -966,9 +1114,10 @@ app.add_middleware(
 )
 
 
+# Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    log.error(f"Unhandled {type(exc).__name__} on {request.url.path}: {exc}")
+    log.error(f"❌ Unhandled {type(exc).__name__} on {request.url.path}: {exc}")
     return JSONResponse(
         status_code=500,
         content={"error": "An unexpected error occurred. Please try again later."},
@@ -976,38 +1125,46 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 # ──────────────────────────────────────────────────────────────────
-# Endpoints
+# Routes
 # ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
+    """Root endpoint — info."""
     return {
         "name": "Sila — Medical AI Assistant",
-        "version": "14.1.0",
-        "status": "running",
+        "version": "14.2.0",
+        "status": "running ✅",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
+        "docs": "https://sila-medical.docs.io",
     }
 
 
 @app.get("/health")
 def health():
-    # Never touches any SDK — always fast for Railway healthcheck
+    """Health check — ultra-fast, no SDK calls."""
     return {
         "status": "ok",
-        "version": "14.1.0",
-        "embed_model": EMBED_MODEL,
-        "embed_dim": EMBED_DIM,
-        "index": INDEX_NAME,
-        "min_confidence": MIN_CONFIDENCE,
-        "top_k": TOP_K,
+        "version": "14.2.0",
+        "uptime": "healthy",
+        "config": {
+            "embed_model": EMBED_MODEL,
+            "embed_dim": EMBED_DIM,
+            "index": INDEX_NAME,
+            "min_confidence": MIN_CONFIDENCE,
+            "top_k": TOP_K,
+            "rag_strong_threshold": MIN_CONFIDENCE + 0.15,
+        }
     }
 
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest, request: Request) -> AskResponse:
+    """Main medical query endpoint."""
     if _request_semaphore is None:
-        return JSONResponse(status_code=503, content={"error": "Server not ready yet."})
+        return JSONResponse(status_code=503, content={"error": "Server not ready yet"})
 
+    # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         lang = LanguageDetector.detect(req.query)
@@ -1016,8 +1173,10 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
             if lang == "ar"
             else "You have exceeded the rate limit. Please try again after a minute."
         )
+        log.warning(f"[ASK] Rate limit exceeded for {client_ip}")
         return JSONResponse(status_code=429, content={"error": msg})
 
+    # Semaphore
     try:
         await _request_semaphore.acquire()
     except Exception:
@@ -1033,7 +1192,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
         return await asyncio.wait_for(_ask_inner(req), timeout=EXTERNAL_CALL_TIMEOUT)
     except asyncio.TimeoutError:
         lang = LanguageDetector.detect(req.query)
-        log.warning(f"[ASK] Timeout after {EXTERNAL_CALL_TIMEOUT}s: {req.query[:60]}")
+        log.warning(f"[ASK] ❌ Timeout after {EXTERNAL_CALL_TIMEOUT}s")
         msg = (
             "عذراً، استغرق الطلب وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى."
             if lang == "ar"
@@ -1052,52 +1211,65 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
+    """Inner logic for /ask endpoint."""
     q        = req.query
     language = LanguageDetector.detect(q)
     intent   = await IntentClassifier.classify(q)
 
-    log.info(f"[ASK] lang={language} intent={intent} query='{q[:80]}'")
+    log.info(f"[ASK] Query: '{q[:80]}' | lang={language} | intent={intent}")
 
-    # ── Social path ───────────────────────────────────────────────
+    # ── SOCIAL INTENT ─────────────────────────────────────────────
     if intent == "social":
         reply, model_used = await state.gemini.reply_social(q, language)
+        log.info(f"[ASK] ✅ Social response — {model_used}")
         return AskResponse(
             query=q, reply=reply, model_used=model_used, matches=[],
             is_medical=False, found_in_database=False, low_confidence=False,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
 
-    # ── Medical: retrieve from KB ─────────────────────────────────
+    # ── MEDICAL INTENT: RETRIEVE FROM KB ──────────────────────────
     try:
         matches = await state.knowledge_base.search(q, top_k=TOP_K)
     except Exception as exc:
-        log.error(f"[ASK] KB search error: {exc}")
+        log.error(f"[ASK] KB search failed: {exc}")
         matches = []
 
-    # ── 3-Tier Decision Engine ─────────────────────────────────────
+    # ── 3-TIER DECISION ENGINE ────────────────────────────────────
     top_score            = matches[0].confidence if matches else 0.0
     category_consistency = KnowledgeBaseService._category_consistency(matches)
+    relevance_ok         = KnowledgeBaseService._relevance_ok(q, matches)
 
+    # Determine RAG mode
     if not matches or top_score < MIN_CONFIDENCE:
         rag_mode = "GEMINI_ONLY"
-    elif top_score >= MIN_CONFIDENCE + 0.10 and category_consistency >= 0.7:
+        reason   = f"no_matches_or_low_score(score={top_score:.3f})"
+    elif not relevance_ok:
+        rag_mode = "GEMINI_ONLY"
+        reason   = "relevance_guard_failed"
+    elif top_score >= MIN_CONFIDENCE + 0.15 and category_consistency >= 0.7:
         rag_mode = "RAG_STRONG"
+        reason   = f"high_confidence_{top_score:.3f}_consistent_categories"
     elif top_score >= MIN_CONFIDENCE:
         rag_mode = "RAG_WEAK"
+        reason   = f"medium_confidence_{top_score:.3f}"
     else:
         rag_mode = "GEMINI_ONLY"
+        reason   = "fallback"
 
+    # Get category distribution
     category_dist: Dict[str, int] = {}
     if matches:
         categories = [m.category for m in matches if m.category]
         category_dist = dict(Counter(categories))
 
     log.info(
-        f"[ASK] {rag_mode}_SELECTED: top_score={top_score:.4f} "
-        f"match_count={len(matches)} category_consistency={category_consistency:.2f} "
-        f"category_dist={category_dist}"
+        f"[ASK] 🎯 {rag_mode} — {reason} "
+        f"| top_score={top_score:.4f} | matches={len(matches)} "
+        f"| relevance_ok={relevance_ok} | category_consistency={category_consistency:.2f}"
     )
 
+    # Convert to response format
     match_results = [
         MatchResult(
             question=m.question,
@@ -1114,6 +1286,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
         try:
             prompt            = state.prompt_builder.build(ctx)
             reply, model_used = await state.gemini.generate(prompt)
+            log.info(f"[ASK] ✅ RAG_STRONG — {model_used}")
             return AskResponse(
                 query=q, reply=reply, model_used=model_used,
                 matches=match_results,
@@ -1121,7 +1294,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
                 language=language, disclaimer=MEDICAL_DISCLAIMER,
             )
         except Exception as exc:
-            log.error(f"[ASK] RAG_STRONG Gemini failed: {exc}")
+            log.error(f"[ASK] RAG_STRONG Gemini failed: {exc} — fallback to GEMINI_ONLY")
             rag_mode = "GEMINI_ONLY"
 
     # ── RAG_WEAK ──────────────────────────────────────────────────
@@ -1130,6 +1303,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
         try:
             prompt            = state.prompt_builder.build_rag_weak(ctx)
             reply, model_used = await state.gemini.generate(prompt)
+            log.info(f"[ASK] ✅ RAG_WEAK — {model_used}")
             return AskResponse(
                 query=q, reply=reply, model_used=model_used,
                 matches=match_results,
@@ -1137,13 +1311,14 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
                 language=language, disclaimer=MEDICAL_DISCLAIMER,
             )
         except Exception as exc:
-            log.error(f"[ASK] RAG_WEAK Gemini failed: {exc}")
+            log.error(f"[ASK] RAG_WEAK Gemini failed: {exc} — fallback to GEMINI_ONLY")
             rag_mode = "GEMINI_ONLY"
 
     # ── GEMINI_ONLY ───────────────────────────────────────────────
     try:
         prompt            = state.prompt_builder.build_gemini_only(q, language)
         reply, model_used = await state.gemini.generate(prompt)
+        log.info(f"[ASK] ✅ GEMINI_ONLY — {model_used}")
         return AskResponse(
             query=q, reply=reply, model_used=model_used,
             matches=match_results,
@@ -1151,7 +1326,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
     except Exception as exc:
-        log.error(f"[ASK] GEMINI_ONLY failed: {exc}")
+        log.error(f"[ASK] ❌ GEMINI_ONLY failed: {exc}")
         reply = state.prompt_builder.no_data_response(language)
         return AskResponse(
             query=q, reply=reply, model_used="none",
@@ -1163,8 +1338,11 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
 @app.post("/analyze-image", response_model=ImageAnalysisResponse)
 async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
+    """Image analysis endpoint — medical images only."""
+
+    # Validate MIME type
     if file.content_type not in ALLOWED_IMAGE_TYPES:
-        log.warning(f"[IMAGE] Rejected: {file.content_type}")
+        log.warning(f"[IMAGE] ❌ Rejected MIME type: {file.content_type}")
         return JSONResponse(status_code=400, content={
             "status": "error",
             "analysis": (
@@ -1175,10 +1353,11 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
+    # Read file
     try:
         image_bytes = await file.read()
     except Exception as exc:
-        log.error(f"[IMAGE] Read failed '{file.filename}': {exc}")
+        log.error(f"[IMAGE] ❌ Failed to read '{file.filename}': {exc}")
         return JSONResponse(status_code=400, content={
             "status": "error",
             "analysis": "فشل في قراءة الملف. تأكد من أن الصورة غير تالفة وحاول مرة أخرى.",
@@ -1186,6 +1365,7 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
+    # Validate not empty
     if not image_bytes:
         return JSONResponse(status_code=400, content={
             "status": "error",
@@ -1194,7 +1374,9 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
+    # Validate size
     if len(image_bytes) > MAX_IMAGE_BYTES:
+        log.warning(f"[IMAGE] ❌ File too large: {len(image_bytes) / 1024 / 1024:.1f}MB")
         return JSONResponse(status_code=413, content={
             "status": "error",
             "analysis": (
@@ -1205,15 +1387,16 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
-    log.info(f"[IMAGE] Processing: '{file.filename}' {len(image_bytes) / 1024:.1f}KB")
+    log.info(f"[IMAGE] Processing: '{file.filename}' ({len(image_bytes) / 1024:.1f}KB)")
 
+    # Analyze
     try:
         status, analysis, model_used = await asyncio.wait_for(
             state.gemini.analyze_image(image_bytes, file.content_type),
             timeout=EXTERNAL_CALL_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.warning("[IMAGE] Timed out.")
+        log.warning("[IMAGE] ❌ Timeout")
         return JSONResponse(status_code=504, content={
             "status": "error",
             "analysis": "انتهت مهلة تحليل الصورة. يرجى المحاولة مرة أخرى.",
@@ -1221,8 +1404,8 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
-    http_status = 503 if status == "error" else 200
-    log.info(f"[IMAGE] Done — status={status} model={model_used}")
+    http_status = 200 if status == "success" else 503 if status == "error" else 200
+    log.info(f"[IMAGE] ✅ Done — status={status} model={model_used}")
 
     return JSONResponse(status_code=http_status, content={
         "status": status,
@@ -1230,3 +1413,20 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
         "model_used": model_used,
         "disclaimer": MEDICAL_DISCLAIMER,
     })
+
+
+# ──────────────────────────────────────────────────────────────────
+# Main Entry Point
+# ──────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    log.info("🚀 Starting SILA v14.2 server…")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        access_log=True,
+    )
