@@ -12,7 +12,7 @@ pydantic==2.10.3
 # ── Embeddings (CPU-only, 384-dim) ────────────────────────────────
 sentence-transformers==3.3.1
 
-# Torch CPU-only (Railway safe)
+# Torch CPU-only
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1+cpu ; platform_system != "Darwin"
 torch==2.5.1     ; platform_system == "Darwin"
@@ -22,7 +22,3 @@ pinecone==5.4.2
 
 # ── LLM ───────────────────────────────────────────────────────────
 google-genai==1.10.0
-
-# ── Performance / stability (IMPORTANT for Railway) ──────────────
-numpy==1.26.4
-scipy==1.11.4
