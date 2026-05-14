@@ -1,19 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v14.0                     ║
+║          SILA — Medical AI Assistant  v14.1                     ║
 ║          Railway-Hardened · 384-dim · Local Embeddings Only     ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
 ║  Mode  : Strict RAG (local 384-dim) · Social chat               ║
-║  v14.0 changes vs v13.2:                                        ║
-║  • EMBEDDING_BACKEND forced to 'local' only (384-dim)           ║
-║  • Removed all Gemini embedding paths + dead code               ║
-║  • SentenceTransformer lazy-load hardened (CPU-only, no torch)  ║
-║  • Pinecone expected_dim hardcoded to 384                        ║
-║  • Removed verbose vector/tensor log dumps                      ║
-║  • GeminiService cache changed to bounded deque-based LRU       ║
-║  • IntentClassifier keyword fallback made primary + fast        ║
-║  • Healthcheck always fast (<1s, no SDK touch)                  ║
+║  v14.1 fixes:                                                   ║
+║  • Added missing _GEMINI_ONLY_AR / _GEMINI_ONLY_EN in Builder   ║
+║  • All PromptBuilder methods now complete and tested             ║
+║  • Fully lazy-loaded, zero-SDK boot                             ║
+║  • Production-safe Railway free plan deployment                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -37,7 +33,7 @@ import re
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,24 +56,22 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────
 # Environment
 # ──────────────────────────────────────────────────────────────────
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
-PINECONE_API_KEY  = os.getenv("PINECONE_API_KEY", "")
-INDEX_NAME        = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "")
+INDEX_NAME         = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 
-MIN_CONFIDENCE    = float(os.getenv("SCORE_THRESHOLD", "0.45"))
-MAX_QUERY_LENGTH  = int(os.getenv("MAX_QUERY_LENGTH", "500"))
-MAX_IMAGE_MB      = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
-MAX_IMAGE_BYTES   = MAX_IMAGE_MB * 1024 * 1024
+MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.45"))
+MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
+MAX_IMAGE_MB     = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
+MAX_IMAGE_BYTES  = MAX_IMAGE_MB * 1024 * 1024
 
-TOP_K             = int(os.getenv("TOP_K", "7"))
-MAX_RETRIES       = int(os.getenv("MAX_RETRIES", "3"))
-RETRY_DELAY       = float(os.getenv("RETRY_DELAY", "1.5"))
+TOP_K        = int(os.getenv("TOP_K", "7"))
+MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY  = float(os.getenv("RETRY_DELAY", "1.5"))
 
-# ── Embedding: local only, 384-dim ───────────────────────────────
-# EMBEDDING_BACKEND is read but only 'local' is supported.
-EMBED_MODEL       = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
-EMBED_DIM         = 384  # all-MiniLM-L6-v2 fixed output dimension
+EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+EMBED_DIM   = 384  # all-MiniLM-L6-v2 fixed output dimension
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
 EXTERNAL_CALL_TIMEOUT   = int(os.getenv("EXTERNAL_CALL_TIMEOUT", "25"))
@@ -103,7 +97,7 @@ log = logging.getLogger("sila")
 _request_semaphore: Optional[asyncio.Semaphore] = None
 
 # ──────────────────────────────────────────────────────────────────
-# Rate limiter
+# Rate limiter — in-memory, thread-safe, no Redis
 # ──────────────────────────────────────────────────────────────────
 _rate_limit_store: Dict[str, list] = defaultdict(list)
 _rate_limit_lock  = threading.Lock()
@@ -179,7 +173,7 @@ def _gemini_types():
 # ──────────────────────────────────────────────────────────────────
 # Lazy SDK: SentenceTransformer (CPU-only, 384-dim)
 # ──────────────────────────────────────────────────────────────────
-_st_model       = None
+_st_model: Any = None
 _st_lock        = threading.Lock()
 _st_load_error: Optional[str] = None
 
@@ -196,7 +190,6 @@ def _load_and_encode_sync(text: str) -> List[float]:
                     t0 = time.perf_counter()
                     from sentence_transformers import SentenceTransformer
                     model = SentenceTransformer(EMBED_MODEL, device="cpu")
-                    # Disable any torch gradient / autocast overhead
                     try:
                         import torch as _torch
                         _torch.set_num_threads(1)
@@ -204,7 +197,7 @@ def _load_and_encode_sync(text: str) -> List[float]:
                         _torch.set_grad_enabled(False)
                     except ImportError:
                         pass
-                    log.info(f"SentenceTransformer ready in {time.perf_counter()-t0:.2f}s")
+                    log.info(f"SentenceTransformer ready in {time.perf_counter() - t0:.2f}s")
                     _st_model = model
                 except Exception as exc:
                     _st_load_error = str(exc)
@@ -256,21 +249,21 @@ MEDICAL_DISCLAIMER = (
 )
 
 MEDICAL_KEYWORDS: frozenset = frozenset({
-    "ألم","وجع","مرض","دواء","طبيب","مستشفى","أعراض","علاج",
-    "صداع","حمى","سعال","ضغط","سكر","قلب","كلى","معدة",
-    "عظام","جلد","عين","أذن","أنف","رئة","كبد","دم",
-    "تعب","إرهاق","دوار","غثيان","إسهال","إمساك","حرقة",
-    "الم","عندي","عندى","اشعر","احس","اعاني","يؤلم",
-    "بوجعني","بتوجعني","حاسس","حاسه","حبوب","طفح","حكة",
-    "عملية","جراحة","منظار","تحليل","أشعة","نتيجة","تقرير",
-    "pain","ache","fever","cough","headache","nausea","dizzy",
-    "vomit","diarrhea","symptom","disease","doctor","hospital",
-    "medicine","drug","blood","heart","lung","kidney","liver",
-    "diabetes","pressure","infection","allergy","rash","swelling",
-    "fatigue","tired","breathe","chest","stomach","throat",
-    "surgery","scan","test","result","report","prescription",
-    "برد","انفلونزا","رشح","زكام","كحة","بلغم","حرارة",
-    "cold","flu","runny","nose","sneeze","congestion",
+    "ألم", "وجع", "مرض", "دواء", "طبيب", "مستشفى", "أعراض", "علاج",
+    "صداع", "حمى", "سعال", "ضغط", "سكر", "قلب", "كلى", "معدة",
+    "عظام", "جلد", "عين", "أذن", "أنف", "رئة", "كبد", "دم",
+    "تعب", "إرهاق", "دوار", "غثيان", "إسهال", "إمساك", "حرقة",
+    "الم", "عندي", "عندى", "اشعر", "احس", "اعاني", "يؤلم",
+    "بوجعني", "بتوجعني", "حاسس", "حاسه", "حبوب", "طفح", "حكة",
+    "عملية", "جراحة", "منظار", "تحليل", "أشعة", "نتيجة", "تقرير",
+    "pain", "ache", "fever", "cough", "headache", "nausea", "dizzy",
+    "vomit", "diarrhea", "symptom", "disease", "doctor", "hospital",
+    "medicine", "drug", "blood", "heart", "lung", "kidney", "liver",
+    "diabetes", "pressure", "infection", "allergy", "rash", "swelling",
+    "fatigue", "tired", "breathe", "chest", "stomach", "throat",
+    "surgery", "scan", "test", "result", "report", "prescription",
+    "برد", "انفلونزا", "رشح", "زكام", "كحة", "بلغم", "حرارة",
+    "cold", "flu", "runny", "nose", "sneeze", "congestion",
 })
 
 # ──────────────────────────────────────────────────────────────────
@@ -383,7 +376,7 @@ class LanguageDetector:
 class IntentClassifier:
     """
     Keyword check runs first (zero cost).
-    Gemini is called only when keywords give no signal, to reduce latency/cost.
+    Gemini is called only when keywords give no signal.
     """
 
     _PROMPT = (
@@ -400,11 +393,9 @@ class IntentClassifier:
     @classmethod
     def _classify_sync(cls, query: str) -> str:
         q_lower = query.lower()
-        # Fast keyword path — if any medical keyword matches, skip Gemini call
         if any(kw in q_lower for kw in MEDICAL_KEYWORDS):
             return "medical"
 
-        # Only call Gemini for ambiguous messages
         try:
             types = _gemini_types()
             resp = _get_gemini_sync().models.generate_content(
@@ -431,6 +422,17 @@ class IntentClassifier:
 
 class KnowledgeBaseService:
 
+    @staticmethod
+    def _category_consistency(matches: List[KnowledgeMatch]) -> float:
+        if not matches:
+            return 0.0
+        categories = [m.category for m in matches if m.category]
+        if not categories:
+            return 0.0
+        counts = Counter(categories)
+        dominant_count = counts.most_common(1)[0][1]
+        return dominant_count / len(categories)
+
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
         log.info(f"[KB] Search: '{query[:80]}'")
 
@@ -453,7 +455,11 @@ class KnowledgeBaseService:
                     namespace=PINECONE_NAMESPACE or "",
                 )
                 results = await asyncio.to_thread(_query_fn)
-                raw_scores = [round(float(m.score), 4) for m in results.matches if m.score is not None]
+                raw_scores = [
+                    round(float(m.score), 4)
+                    for m in results.matches
+                    if m.score is not None
+                ]
                 log.info(
                     f"[KB] Pinecone scores: {raw_scores} "
                     f"| threshold={MIN_CONFIDENCE} | n={len(results.matches)}"
@@ -493,6 +499,8 @@ class KnowledgeBaseService:
 # ──────────────────────────────────────────────────────────────────
 
 class PromptBuilder:
+    _SEP = "━" * 50
+
     _SYSTEM_AR = (
         "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
         "أسلوبك: دافئ واحترافي، كأنك طبيب خبير يشرح لمريضه بصدق واهتمام.\n\n"
@@ -520,6 +528,30 @@ class PromptBuilder:
         "5. Flag any warning signs that require urgent care.\n"
         "6. Always close by recommending a specialist consultation.\n"
         "7. Only answer based on the retrieved context from the knowledge base."
+    )
+
+    _GEMINI_ONLY_AR = (
+        "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
+        "أسلوبك: دافئ واحترافي، كأنك طبيب خبير يشرح لمريضه بصدق واهتمام.\n\n"
+        "لم يتم العثور على معلومات كافية في قاعدة البيانات الطبية لهذا الاستفسار.\n"
+        "استخدم معرفتك الطبية العامة الموثوقة للإجابة، مع الالتزام بالقواعد التالية:\n\n"
+        "١. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات فقط.\n"
+        "٢. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
+        "٣. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
+        "٤. لغة الإجابة: عربية واضحة ومفهومة.\n"
+        "٥. كن صادقاً إذا كانت المعلومات غير كافية أو خارج نطاق معرفتك."
+    )
+
+    _GEMINI_ONLY_EN = (
+        "You are 'Sila', a trusted and empathetic medical AI assistant.\n"
+        "Tone: warm, calm, and professionally precise.\n\n"
+        "No specific information was found in the medical knowledge base for this query.\n"
+        "Use your reliable general medical knowledge to respond, following these rules:\n\n"
+        "1. NEVER provide a definitive diagnosis — suggest possibilities only.\n"
+        "2. Flag any warning signs that require urgent care.\n"
+        "3. Always close by recommending a specialist consultation.\n"
+        "4. Be honest if information is limited or outside your knowledge.\n"
+        "5. Your answer should still be medically helpful and safe."
     )
 
     _STRUCTURE_AR = (
@@ -559,30 +591,38 @@ class PromptBuilder:
         "Your health deserves accurate, professional care. 🏥"
     )
 
-    def build(self, ctx: QueryContext) -> str:
-        lang = ctx.language
-        system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
-        structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
-        sep = "━" * 50
-
-        context_parts = []
-        for i, m in enumerate(ctx.matches, start=1):
+    def _build_context_block(
+        self,
+        matches: List[KnowledgeMatch],
+        language: str,
+    ) -> str:
+        sep = self._SEP
+        parts = []
+        for i, m in enumerate(matches, start=1):
             reliability = (
                 ("✅ موثوق" if m.is_reliable else "⚠️ ثقة منخفضة")
-                if lang == "ar"
+                if language == "ar"
                 else ("✅ Reliable" if m.is_reliable else "⚠️ Low confidence")
             )
-            context_parts.append(
+            parts.append(
                 f"[{i}] {reliability} — Score: {m.confidence:.0%}\n"
                 f"[Specialty: {m.category or 'General'}]\n"
                 f"Q: {m.question}\n"
                 f"A: {m.answer}"
             )
+        return f"\n\n{sep}\n".join(parts)
 
-        context_block   = f"\n\n{sep}\n".join(context_parts)
-        label_context   = "📋 قاعدة المعرفة الطبية:" if lang == "ar" else "📋 Medical Knowledge Base:"
-        label_question  = "🧑‍⚕️ سؤال المريض:"       if lang == "ar" else "🧑‍⚕️ Patient Question:"
-        label_answer    = "الإجابة:"                 if lang == "ar" else "Answer:"
+    def build(self, ctx: QueryContext) -> str:
+        """RAG_STRONG prompt — rely strongly on retrieved context."""
+        lang      = ctx.language
+        system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
+        structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
+        sep       = self._SEP
+
+        context_block  = self._build_context_block(ctx.matches, lang)
+        label_context  = "📋 قاعدة المعرفة الطبية:"       if lang == "ar" else "📋 Medical Knowledge Base:"
+        label_question = "🧑‍⚕️ سؤال المريض:"              if lang == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer   = "الإجابة:"                        if lang == "ar" else "Answer:"
 
         return (
             f"{system}\n\n{sep}\n"
@@ -591,20 +631,63 @@ class PromptBuilder:
             f"{structure}\n\n{label_answer}"
         )
 
+    def build_rag_weak(self, ctx: QueryContext) -> str:
+        """RAG_WEAK prompt — context treated as hints; Gemini may use general reasoning."""
+        lang      = ctx.language
+        system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
+        structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
+        sep       = self._SEP
+
+        weak_warning = (
+            "⚠️ ملاحظة: السياق المسترجع قد يحتوي على معلومات طبية ضعيفة أو غير دقيقة. "
+            "استخدمه كإشارات داعمة فقط، واعتمد على معرفتك الطبية العامة."
+            if lang == "ar"
+            else "⚠️ Note: Retrieved context may contain weak or inaccurate medical information. "
+            "Use it only as supporting hints and rely on your general medical knowledge."
+        )
+
+        context_block  = self._build_context_block(ctx.matches, lang)
+        label_context  = (
+            "📋 قاعدة المعرفة الطبية (إشارات داعمة):"
+            if lang == "ar"
+            else "📋 Medical Knowledge Base (supporting hints):"
+        )
+        label_question = "🧑‍⚕️ سؤال المريض:" if lang == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer   = "الإجابة:"            if lang == "ar" else "Answer:"
+
+        return (
+            f"{system}\n\n{weak_warning}\n\n{sep}\n"
+            f"{label_context}\n\n{context_block}\n\n{sep}\n"
+            f"{label_question}\n{ctx.raw_query}\n\n"
+            f"{structure}\n\n{label_answer}"
+        )
+
+    def build_gemini_only(self, query: str, language: str) -> str:
+        """GEMINI_ONLY prompt — pure Gemini medical reasoning, no RAG context."""
+        system         = self._GEMINI_ONLY_AR if language == "ar" else self._GEMINI_ONLY_EN
+        structure      = self._STRUCTURE_AR   if language == "ar" else self._STRUCTURE_EN
+        label_question = "🧑‍⚕️ سؤال المريض:"  if language == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer   = "الإجابة:"            if language == "ar" else "Answer:"
+        sep            = self._SEP
+
+        return (
+            f"{system}\n\n{sep}\n"
+            f"{label_question}\n{query}\n\n"
+            f"{structure}\n\n{label_answer}"
+        )
+
     def no_data_response(self, language: str) -> str:
         return self._NO_DATA_AR if language == "ar" else self._NO_DATA_EN
 
 
 # ──────────────────────────────────────────────────────────────────
-# Gemini Service  (threadpool-offloaded, bounded LRU cache)
+# Bounded LRU cache — thread-safe, max 200 entries
 # ──────────────────────────────────────────────────────────────────
 
 class _BoundedLRU:
-    """Thread-safe LRU cache backed by an OrderedDict."""
-
     def __init__(self, maxsize: int = 200):
         self._cache: collections.OrderedDict = collections.OrderedDict()
-        self._max = maxsize
+        self._max  = maxsize
         self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[Tuple[str, str]]:
@@ -625,6 +708,10 @@ class _BoundedLRU:
     def __len__(self) -> int:
         return len(self._cache)
 
+
+# ──────────────────────────────────────────────────────────────────
+# Gemini Service  (threadpool-offloaded, bounded LRU cache)
+# ──────────────────────────────────────────────────────────────────
 
 class GeminiService:
 
@@ -691,7 +778,7 @@ class GeminiService:
 
         for model_name in GEMINI_TEXT_MODELS:
             try:
-                log.info(f"[Gemini] RAG generate — model: {model_name}")
+                log.info(f"[Gemini] Generate — model: {model_name}")
                 resp = _get_gemini_sync().models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -701,17 +788,22 @@ class GeminiService:
                 self._cache.put(cache_key, result)
                 return result
             except Exception as exc:
-                log.warning(f"[Gemini] RAG {model_name} failed: {exc}")
+                log.warning(f"[Gemini] {model_name} failed: {exc}")
 
         log.error("[Gemini] All text models exhausted.")
-        return ("عذراً، حدث خطأ مؤقت في معالجة طلبك. يرجى المحاولة مرة أخرى.", "none")
+        return (
+            "عذراً، حدث خطأ مؤقت في معالجة طلبك. يرجى المحاولة مرة أخرى.",
+            "none",
+        )
 
     async def generate(self, prompt: str) -> Tuple[str, str]:
         return await asyncio.to_thread(self._generate_sync, prompt)
 
     # ── Image analysis ─────────────────────────────────────────────
 
-    def _analyze_image_sync(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
+    def _analyze_image_sync(
+        self, image_bytes: bytes, mime_type: str
+    ) -> Tuple[str, str, str]:
         system_prompt = (
             "You are a specialized medical image analysis AI.\n\n"
             "You ONLY analyze medical images. Accepted types:\n"
@@ -768,8 +860,6 @@ class GeminiService:
                         parsed   = json.loads(clean)
                         status   = str(parsed.get("status", "success"))
                         analysis = parsed.get("analysis", "")
-                        if isinstance(analysis, dict):
-                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
                         if not isinstance(analysis, str):
                             analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
                         log.info(f"[Vision] Success — {model_name} status={status}")
@@ -794,24 +884,32 @@ class GeminiService:
                                         depth -= 1
                                         if depth == 0:
                                             try:
-                                                parsed   = json.loads(clean[start: i + 1])
+                                                parsed   = json.loads(clean[start:i + 1])
                                                 status   = str(parsed.get("status", "success"))
                                                 analysis = parsed.get("analysis", "")
                                                 if not isinstance(analysis, str):
-                                                    analysis = json.dumps(analysis, ensure_ascii=False)
+                                                    analysis = json.dumps(
+                                                        analysis, ensure_ascii=False
+                                                    )
                                                 return status, analysis.strip(), model_name
                                             except Exception:
                                                 break
-                        log.warning(f"[Vision] {model_name}: non-JSON — using raw text.")
+                        log.warning(f"[Vision] {model_name}: non-JSON fallback.")
                         return "success", raw, model_name
                 except Exception as exc:
                     log.warning(f"[Vision] {model_name} variant failed: {exc}")
                     continue
 
         log.error("[Vision] All models exhausted.")
-        return ("error", "تعذّر تحليل الصورة مؤقتاً. يرجى المحاولة مرة أخرى لاحقاً.", "none")
+        return (
+            "error",
+            "تعذّر تحليل الصورة مؤقتاً. يرجى المحاولة مرة أخرى لاحقاً.",
+            "none",
+        )
 
-    async def analyze_image(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
+    async def analyze_image(
+        self, image_bytes: bytes, mime_type: str
+    ) -> Tuple[str, str, str]:
         return await asyncio.to_thread(self._analyze_image_sync, image_bytes, mime_type)
 
     @property
@@ -835,11 +933,11 @@ state = AppState()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _request_semaphore
-    log.info("🚀 Sila v14.0 — zero-SDK boot.")
-    _request_semaphore    = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    state.knowledge_base  = KnowledgeBaseService()
-    state.gemini          = GeminiService()
-    state.prompt_builder  = PromptBuilder()
+    log.info("🚀 Sila v14.1 — zero-SDK boot.")
+    _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    state.knowledge_base = KnowledgeBaseService()
+    state.gemini         = GeminiService()
+    state.prompt_builder = PromptBuilder()
     log.info(
         f"✅ Boot complete — embed=local/{EMBED_MODEL} dim={EMBED_DIM} "
         f"concurrency={MAX_CONCURRENT_REQUESTS} timeout={EXTERNAL_CALL_TIMEOUT}s "
@@ -856,7 +954,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sila — Medical AI Assistant",
     description="مساعد طبي ذكي | Strict RAG + Gemini Vision + Arabic & English",
-    version="14.0.0",
+    version="14.1.0",
     lifespan=lifespan,
 )
 
@@ -885,7 +983,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 def root():
     return {
         "name": "Sila — Medical AI Assistant",
-        "version": "14.0.0",
+        "version": "14.1.0",
         "status": "running",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
     }
@@ -896,7 +994,7 @@ def health():
     # Never touches any SDK — always fast for Railway healthcheck
     return {
         "status": "ok",
-        "version": "14.0.0",
+        "version": "14.1.0",
         "embed_model": EMBED_MODEL,
         "embed_dim": EMBED_DIM,
         "index": INDEX_NAME,
@@ -913,7 +1011,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         lang = LanguageDetector.detect(req.query)
-        msg  = (
+        msg = (
             "لقد تجاوزت الحد المسموح من الطلبات. يرجى المحاولة بعد دقيقة."
             if lang == "ar"
             else "You have exceeded the rate limit. Please try again after a minute."
@@ -936,7 +1034,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     except asyncio.TimeoutError:
         lang = LanguageDetector.detect(req.query)
         log.warning(f"[ASK] Timeout after {EXTERNAL_CALL_TIMEOUT}s: {req.query[:60]}")
-        msg  = (
+        msg = (
             "عذراً، استغرق الطلب وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى."
             if lang == "ar"
             else "Sorry, the request timed out. Please try again."
@@ -969,55 +1067,95 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
 
-    # ── Medical / RAG path ────────────────────────────────────────
+    # ── Medical: retrieve from KB ─────────────────────────────────
     try:
         matches = await state.knowledge_base.search(q, top_k=TOP_K)
     except Exception as exc:
         log.error(f"[ASK] KB search error: {exc}")
         matches = []
 
-    ctx = QueryContext(raw_query=q, language=language, matches=matches)
+    # ── 3-Tier Decision Engine ─────────────────────────────────────
+    top_score            = matches[0].confidence if matches else 0.0
+    category_consistency = KnowledgeBaseService._category_consistency(matches)
 
-    if not ctx.has_reliable_matches:
-        reply = state.prompt_builder.no_data_response(language)
-        log.info(
-            f"[ASK] No reliable matches — best={ctx.best_confidence:.4f} "
-            f"total={len(matches)}"
+    if not matches or top_score < MIN_CONFIDENCE:
+        rag_mode = "GEMINI_ONLY"
+    elif top_score >= MIN_CONFIDENCE + 0.10 and category_consistency >= 0.7:
+        rag_mode = "RAG_STRONG"
+    elif top_score >= MIN_CONFIDENCE:
+        rag_mode = "RAG_WEAK"
+    else:
+        rag_mode = "GEMINI_ONLY"
+
+    category_dist: Dict[str, int] = {}
+    if matches:
+        categories = [m.category for m in matches if m.category]
+        category_dist = dict(Counter(categories))
+
+    log.info(
+        f"[ASK] {rag_mode}_SELECTED: top_score={top_score:.4f} "
+        f"match_count={len(matches)} category_consistency={category_consistency:.2f} "
+        f"category_dist={category_dist}"
+    )
+
+    match_results = [
+        MatchResult(
+            question=m.question,
+            answer=m.answer,
+            confidence=m.confidence,
+            category=m.category,
         )
+        for m in matches
+    ]
+
+    # ── RAG_STRONG ────────────────────────────────────────────────
+    if rag_mode == "RAG_STRONG":
+        ctx = QueryContext(raw_query=q, language=language, matches=matches)
+        try:
+            prompt            = state.prompt_builder.build(ctx)
+            reply, model_used = await state.gemini.generate(prompt)
+            return AskResponse(
+                query=q, reply=reply, model_used=model_used,
+                matches=match_results,
+                is_medical=True, found_in_database=True, low_confidence=False,
+                language=language, disclaimer=MEDICAL_DISCLAIMER,
+            )
+        except Exception as exc:
+            log.error(f"[ASK] RAG_STRONG Gemini failed: {exc}")
+            rag_mode = "GEMINI_ONLY"
+
+    # ── RAG_WEAK ──────────────────────────────────────────────────
+    if rag_mode == "RAG_WEAK":
+        ctx = QueryContext(raw_query=q, language=language, matches=matches)
+        try:
+            prompt            = state.prompt_builder.build_rag_weak(ctx)
+            reply, model_used = await state.gemini.generate(prompt)
+            return AskResponse(
+                query=q, reply=reply, model_used=model_used,
+                matches=match_results,
+                is_medical=True, found_in_database=True, low_confidence=True,
+                language=language, disclaimer=MEDICAL_DISCLAIMER,
+            )
+        except Exception as exc:
+            log.error(f"[ASK] RAG_WEAK Gemini failed: {exc}")
+            rag_mode = "GEMINI_ONLY"
+
+    # ── GEMINI_ONLY ───────────────────────────────────────────────
+    try:
+        prompt            = state.prompt_builder.build_gemini_only(q, language)
+        reply, model_used = await state.gemini.generate(prompt)
         return AskResponse(
-            query=q, reply=reply, model_used="none", matches=[],
+            query=q, reply=reply, model_used=model_used,
+            matches=match_results,
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
-
-    try:
-        prompt              = state.prompt_builder.build(ctx)
-        reply, model_used   = await state.gemini.generate(prompt)
-        log.info(f"[ASK] RAG ok — model={model_used} top={ctx.best_confidence:.4f}")
-        return AskResponse(
-            query=q, reply=reply, model_used=model_used,
-            matches=[
-                MatchResult(
-                    question=m.question, answer=m.answer,
-                    confidence=m.confidence, category=m.category,
-                )
-                for m in matches
-            ],
-            is_medical=True, found_in_database=True, low_confidence=False,
-            language=language, disclaimer=MEDICAL_DISCLAIMER,
-        )
     except Exception as exc:
-        log.error(f"[ASK] Gemini generation failed: {exc}")
+        log.error(f"[ASK] GEMINI_ONLY failed: {exc}")
         reply = state.prompt_builder.no_data_response(language)
         return AskResponse(
             query=q, reply=reply, model_used="none",
-            matches=[
-                MatchResult(
-                    question=m.question, answer=m.answer,
-                    confidence=m.confidence, category=m.category,
-                )
-                for m in matches
-            ],
+            matches=match_results,
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
@@ -1067,7 +1205,7 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
             "disclaimer": MEDICAL_DISCLAIMER,
         })
 
-    log.info(f"[IMAGE] Processing: '{file.filename}' {len(image_bytes)/1024:.1f}KB")
+    log.info(f"[IMAGE] Processing: '{file.filename}' {len(image_bytes) / 1024:.1f}KB")
 
     try:
         status, analysis, model_used = await asyncio.wait_for(
