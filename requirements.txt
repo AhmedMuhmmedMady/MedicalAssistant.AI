@@ -10,7 +10,6 @@ python-dotenv==1.0.1
 
 # Google GenAI (strict compatible)
 google-genai==1.16.0
-anyio>=4.8.0,<5.0.0
 
 # HTTP layer (required by google-genai)
 httpx>=0.28.1,<1.0.0
@@ -20,15 +19,16 @@ pinecone==5.4.2
 
 # ML stack (keep flexible to avoid conflicts)
 sentence-transformers==3.3.1
-transformers>=4.46.0,<5.0.0
-tokenizers>=0.20.0,<0.22.0
+transformers==4.46.3
+tokenizers==0.20.3
 
 # Torch CPU only (must stay pinned)
 torch==2.5.1+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-numpy>=1.26.4,<2.0.0
+numpy==1.26.4
 
 python-multipart==0.0.20
 
+typing-extensions>=4.12.0
 requests==2.32.3

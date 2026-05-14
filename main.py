@@ -302,6 +302,37 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
     "cold", "flu", "runny", "nose", "sneeze", "congestion",
 })
 
+# Low-quality answer patterns (garbage KB responses)
+LOW_QUALITY_PATTERNS: frozenset = frozenset({
+    "طبيعي",
+    "تم الاجابة",
+    "كل شيء ممكن",
+    "راجع الطبيب",
+    "natural",
+    "answered",
+    "everything possible",
+    "consult doctor",
+})
+
+# Emergency keywords (require immediate ER attention)
+EMERGENCY_KEYWORDS_AR: frozenset = frozenset({
+    "ألم صدر", "ضيق تنفس", "نوبة قلبية", "سكتة دماغية", "نزيف شديد",
+    "إغماء", "فقدان وعي", "صدمة", "حروق شديدة", "كسر عظم",
+    "ألم حاد", "طوارئ", "إسعاف", "علاج فوري", "خطر على الحياة",
+    "ضربة شمس", "تسمم", "جرح عميق", "نزيف داخلي", "انفجار",
+    "ألم بطن حاد", "صعوبة بلع", "خدر", "شلل", "تشنج",
+    "انتحار", "أفكار انتحارية", "إيذاء النفس",
+})
+
+EMERGENCY_KEYWORDS_EN: frozenset = frozenset({
+    "chest pain", "difficulty breathing", "heart attack", "stroke", "severe bleeding",
+    "fainting", "loss of consciousness", "shock", "severe burns", "broken bone",
+    "severe pain", "emergency", "ambulance", "immediate treatment", "life threatening",
+    "heat stroke", "poisoning", "deep wound", "internal bleeding", "explosion",
+    "severe abdominal pain", "difficulty swallowing", "numbness", "paralysis", "seizure",
+    "suicide", "suicidal thoughts", "self harm",
+})
+
 # ──────────────────────────────────────────────────────────────────
 # Domain Models
 # ──────────────────────────────────────────────────────────────────
@@ -318,6 +349,12 @@ class KnowledgeMatch:
     def is_reliable(self) -> bool:
         """Check if confidence meets minimum threshold."""
         return self.confidence >= MIN_CONFIDENCE
+
+    @property
+    def is_low_quality(self) -> bool:
+        """Check if answer contains low-quality patterns."""
+        answer_lower = self.answer.lower()
+        return any(pattern.lower() in answer_lower for pattern in LOW_QUALITY_PATTERNS)
 
 
 @dataclass
@@ -413,6 +450,24 @@ class LanguageDetector:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Emergency Detection
+# ──────────────────────────────────────────────────────────────────
+
+class EmergencyDetector:
+    """Detect emergency medical queries requiring immediate attention."""
+
+    @staticmethod
+    def is_emergency(query: str, language: str) -> bool:
+        """Check if query contains emergency keywords."""
+        q_lower = query.lower()
+        
+        if language == "ar":
+            return any(kw in q_lower for kw in EMERGENCY_KEYWORDS_AR)
+        else:
+            return any(kw in q_lower for kw in EMERGENCY_KEYWORDS_EN)
+
+
+# ──────────────────────────────────────────────────────────────────
 # Intent Classifier
 # ──────────────────────────────────────────────────────────────────
 
@@ -488,6 +543,75 @@ class KnowledgeBaseService:
         counts = Counter(categories)
         dominant_count = counts.most_common(1)[0][1]
         return round(dominant_count / len(categories), 2)
+
+    @staticmethod
+    def _extract_medical_tokens(text: str) -> set[str]:
+        """
+        Extract medical tokens from text (Arabic + English support).
+        
+        Normalizes Arabic letters, removes diacritics, filters stop words,
+        and keeps only medically relevant tokens (>= 3 chars).
+        """
+        # Normalize Arabic letters (أ -> ا, ة -> ه)
+        arabic_normalization = str.maketrans({
+            'أ': 'ا', 'إ': 'ا', 'آ': 'ا',
+            'ة': 'ه',
+            'ى': 'ي',
+        })
+        
+        # Remove diacritics and normalize
+        clean = re.sub(r"[\u064b-\u065f\u0670]", "", text.lower())
+        clean = clean.translate(arabic_normalization)
+        
+        # Tokenize
+        tokens = set(t for t in re.split(r"[\s\W]+", clean) if len(t) >= 3)
+        
+        # Filter for medical relevance (keep tokens that appear in medical keywords or are longer)
+        medical_tokens = set()
+        for token in tokens:
+            # Keep if it's in medical keywords or is a substantive word
+            if any(kw in token or token in kw for kw in MEDICAL_KEYWORDS):
+                medical_tokens.add(token)
+            elif len(token) >= 4:  # Keep longer tokens as potentially medical
+                medical_tokens.add(token)
+        
+        return medical_tokens
+
+    @staticmethod
+    def _relevance_ok(query: str, matches: List[KnowledgeMatch], min_overlap: int = 1) -> bool:
+        """
+        Relevance Guard: Medical token overlap check to prevent Pinecone cosine drift.
+        
+        Uses medical token extraction for more accurate relevance detection.
+        Checks that at least `min_overlap` medical query tokens appear in top-3 match texts.
+        """
+        if not matches:
+            return False
+
+        # Extract medical tokens from query
+        query_tokens = KnowledgeBaseService._extract_medical_tokens(query)
+        
+        if not query_tokens:
+            # Can't check empty token set — allow through
+            log.info("[KB] Relevance: Query has no medical tokens — allowing")
+            return True
+
+        # Build token set from top-3 match texts
+        combined = " ".join(
+            f"{m.question} {m.answer}" for m in matches[:3]
+        )
+        match_tokens = KnowledgeBaseService._extract_medical_tokens(combined)
+
+        # Check overlap
+        overlap = len(query_tokens & match_tokens)
+        ok = overlap >= min_overlap
+
+        log.info(
+            f"[KB] Relevance: query_tokens={len(query_tokens)} match_tokens={len(match_tokens)} "
+            f"overlap={overlap} min_overlap={min_overlap} result={'✅' if ok else '❌'}"
+        )
+
+        return ok
 
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
         """Search knowledge base and return top matches."""
@@ -1228,6 +1352,11 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
 
+    # ── EMERGENCY DETECTION ───────────────────────────────────────
+    is_emergency = EmergencyDetector.is_emergency(q, language)
+    if is_emergency:
+        log.warning(f"[ASK] 🚨 EMERGENCY_QUERY=True")
+
     # ── MEDICAL INTENT: RETRIEVE FROM KB ──────────────────────────
     try:
         matches = await state.knowledge_base.search(q, top_k=TOP_K)
@@ -1240,6 +1369,10 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     category_consistency = KnowledgeBaseService._category_consistency(matches)
     relevance_ok         = KnowledgeBaseService._relevance_ok(q, matches)
 
+    # Check for low-quality matches (garbage KB responses)
+    low_quality_count = sum(1 for m in matches if m.is_low_quality)
+    low_quality_ratio = low_quality_count / len(matches) if matches else 0.0
+
     # Determine RAG mode
     if not matches or top_score < MIN_CONFIDENCE:
         rag_mode = "GEMINI_ONLY"
@@ -1247,6 +1380,10 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     elif not relevance_ok:
         rag_mode = "GEMINI_ONLY"
         reason   = "relevance_guard_failed"
+    elif low_quality_ratio > 0.6:
+        # More than 60% low-quality matches → downgrade to GEMINI_ONLY
+        rag_mode = "GEMINI_ONLY"
+        reason   = f"low_quality_ratio={low_quality_ratio:.2f}>0.6"
     elif top_score >= MIN_CONFIDENCE + 0.15 and category_consistency >= 0.7:
         rag_mode = "RAG_STRONG"
         reason   = f"high_confidence_{top_score:.3f}_consistent_categories"
@@ -1266,7 +1403,8 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     log.info(
         f"[ASK] 🎯 {rag_mode} — {reason} "
         f"| top_score={top_score:.4f} | matches={len(matches)} "
-        f"| relevance_ok={relevance_ok} | category_consistency={category_consistency:.2f}"
+        f"| relevance_ok={relevance_ok} | category_consistency={category_consistency:.2f} "
+        f"| low_quality_ratio={low_quality_ratio:.2f}"
     )
 
     # Convert to response format
