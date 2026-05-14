@@ -1,0 +1,7 @@
+medical_data.csv
+seed_pinecone.py
+convert_medquad.py
+MedQuAD/
+.venv/
+__pycache__/
+Test.xlsx
