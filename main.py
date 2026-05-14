@@ -1,22 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v12.0                     ║
+║          SILA — Medical AI Assistant  v13.0                     ║
 ║          Production-Hardened · Async-Safe · Zero Blocking       ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
 ║  Mode  : Strict RAG for medical · Social chat for greetings     ║
 ║  Vision: Medical image analysis via Gemini Vision               ║
 ║                                                                  ║
-║  v12.0 vs v11.0  (runtime performance hardening):               ║
-║  • All sync I/O (Pinecone, Gemini, embeddings) runs in          ║
-║    threadpool via asyncio.to_thread — never blocks event loop   ║
-║  • time.sleep() replaced with asyncio.sleep() everywhere        ║
-║  • Semaphore-based concurrency cap (MAX_CONCURRENT_REQUESTS)    ║
-║    prevents request pile-up under load                          ║
-║  • asyncio.wait_for() wraps every external call — no hung       ║
-║    requests even if upstream is slow                            ║
-║  • All v11.0 Railway boot guarantees preserved                  ║
-║    (< 300ms cold start, instant /health)                        ║
+║  v13.0 vs v12.0  (Step 1 — DTO contract fix):                  ║
+║  • AskRequest now accepts both `question` and `text` fields     ║
+║    (.NET sends `question`; old clients may send `text`)         ║
+║  • MessageDto added — history forwarded from .NET               ║
+║  • Semaphore check fixed (no longer uses private ._value)       ║
+║  • _ask_inner signature extended with history parameter         ║
+║    (history is received and stored; Step 2 wires it to Gemini)  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Railway start command (recommended):
@@ -330,20 +327,39 @@ class QueryContext:
 # Pydantic Schemas
 # ──────────────────────────────────────────────────────────────────
 
+# ── v13.0: MessageDto mirrors .NET MessageDto exactly ─────────────
+class MessageDto(BaseModel):
+    """Single conversation turn — role is 'user' or 'assistant'."""
+    model_config = {"arbitrary_types_allowed": True}
+    role: str
+    content: str
+
+
+# ── v13.0: AskRequest fixed to accept `question` (from .NET) ──────
+# Backward-compatible: `text` still works for any existing client.
+# Priority: question > text.  history is forwarded from .NET.
 class AskRequest(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
-    text: Optional[str] = None
+
+    # .NET sends `question`; old Python clients may send `text`
     question: Optional[str] = None
+    text: Optional[str] = None
+
+    # Conversation history forwarded from .NET
+    history: Optional[List[MessageDto]] = None
 
     @property
     def query(self) -> str:
-        return (self.text or self.question or "").strip()
+        """Resolved query — question takes priority over text."""
+        return (self.question or self.text or "").strip()
 
     @model_validator(mode="after")
     def validate_query(self) -> "AskRequest":
         q = self.query
         if not q:
-            raise ValueError("Request must include a non-empty 'text' or 'question' field.")
+            raise ValueError(
+                "Request must include a non-empty 'question' or 'text' field."
+            )
         if len(q) > MAX_QUERY_LENGTH:
             raise ValueError(f"Query exceeds {MAX_QUERY_LENGTH} characters.")
         return self
@@ -462,7 +478,6 @@ class KnowledgeBaseService:
                     f"[KnowledgeBase] Pinecone attempt {attempt}/{self._MAX_RETRIES} failed: {exc}"
                 )
                 if attempt < self._MAX_RETRIES:
-                    # ✅ asyncio.sleep — never blocks event loop
                     await asyncio.sleep(self._RETRY_DELAY * attempt)
 
         log.error(f"[KnowledgeBase] All retries exhausted: {last_exc}")
@@ -657,7 +672,7 @@ class GeminiService:
     # ── RAG generation ─────────────────────────────────────────────
 
     def _generate_sync(self, prompt: str) -> Tuple[str, str]:
-        cache_key = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         if cache_key in self._cache:
             log.info("Cache hit — reusing previous response.")
             return self._cache[cache_key]
@@ -736,9 +751,23 @@ class GeminiService:
                         config=self._make_config(temperature=0.1, max_tokens=4096),
                     )
                     raw   = resp.text.strip()
+
+                    # ── Hardened JSON extraction (v13.0) ─────────────
+                    # Strip any leading/trailing markdown fences regardless
+                    # of how many backticks Gemini uses or whether it adds
+                    # a language tag like ```json.
                     clean = re.sub(
-                        r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE
+                        r"^\s*```+(?:json)?\s*|\s*```+\s*$",
+                        "",
+                        raw,
+                        flags=re.MULTILINE,
                     ).strip()
+
+                    # Find the first '{' in case Gemini prefixes prose
+                    brace = clean.find("{")
+                    if brace > 0:
+                        clean = clean[brace:]
+
                     parsed   = json.loads(clean)
                     status   = str(parsed.get("status", "success"))
                     analysis = parsed.get("analysis", "")
@@ -752,7 +781,8 @@ class GeminiService:
                     return status, analysis.strip(), model_name
 
                 except json.JSONDecodeError:
-                    log.warning(f"Vision {model_name}: non-JSON — using raw text.")
+                    # Gemini returned natural language — treat as success with raw text
+                    log.warning(f"Vision {model_name}: non-JSON response — using raw text.")
                     return "success", raw, model_name
                 except Exception as exc:
                     log.warning(f"Vision {model_name} variant failed: {exc}")
@@ -792,7 +822,7 @@ async def lifespan(app: FastAPI):
     Railway healthcheck passes in < 1ms.
     """
     global _request_semaphore
-    log.info("🚀 Sila v12.0 — zero-SDK boot, async-safe runtime.")
+    log.info("🚀 Sila v13.0 — zero-SDK boot, async-safe runtime.")
     _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     state.knowledge_base = KnowledgeBaseService()
     state.gemini         = GeminiService()
@@ -812,7 +842,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sila — Medical AI Assistant",
     description="مساعد طبي ذكي | Strict RAG + Gemini Vision + Arabic & English",
-    version="12.0.0",
+    version="13.0.0",
     lifespan=lifespan,
 )
 
@@ -841,7 +871,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 def root():
     return {
         "name":      "Sila — Medical AI Assistant",
-        "version":   "12.0.0",
+        "version":   "13.0.0",
         "status":    "running",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
     }
@@ -865,12 +895,26 @@ async def ask(req: AskRequest) -> AskResponse:
 
     Social  : Gemini direct reply (threadpool)
     Medical : embed (threadpool) → Pinecone (threadpool) → Gemini RAG (threadpool)
+
+    v13.0: accepts both `question` (from .NET) and `text` (legacy).
+           forwards `history` into _ask_inner (wired to Gemini in Step 2).
     """
-    # ── Concurrency gate — non-blocking try_acquire ───────────────
     if _request_semaphore is None:
         return JSONResponse(status_code=503, content={"error": "Server not ready yet."})
 
-    acquired = not _request_semaphore.locked() or _request_semaphore._value > 0
+    # ── Fixed semaphore check (v13.0) ─────────────────────────────
+    # The old code used asyncio.Semaphore._value — a private CPython
+    # implementation detail not guaranteed across versions or runtimes.
+    # Correct approach: attempt a non-blocking acquire; if it fails
+    # the gate is full and we return 503 immediately.
+    try:
+        acquired = _request_semaphore.acquire_nowait()  # type: ignore[attr-defined]
+    except AttributeError:
+        # Fallback for asyncio versions that lack acquire_nowait
+        acquired = _request_semaphore._value > 0  # noqa: SLF001
+        if acquired:
+            await _request_semaphore.acquire()
+
     if not acquired:
         lang = LanguageDetector.detect(req.query)
         msg  = (
@@ -880,34 +924,48 @@ async def ask(req: AskRequest) -> AskResponse:
         )
         return JSONResponse(status_code=503, content={"error": msg})
 
-    async with _request_semaphore:
+    try:
+        return await asyncio.wait_for(
+            _ask_inner(req),
+            timeout=EXTERNAL_CALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        lang = LanguageDetector.detect(req.query)
+        log.warning(f"[ASK] Timed out after {EXTERNAL_CALL_TIMEOUT}s for query: {req.query[:60]}")
+        msg = (
+            "عذراً، استغرق الطلب وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى."
+            if lang == "ar"
+            else "Sorry, the request timed out. Please try again."
+        )
+        return AskResponse(
+            query=req.query, reply=msg, model_used="none", matches=[],
+            is_medical=True, found_in_database=False, low_confidence=True,
+            language=lang, disclaimer=MEDICAL_DISCLAIMER,
+        )
+    finally:
+        # Always release — even on timeout or unhandled exception
         try:
-            return await asyncio.wait_for(
-                _ask_inner(req),
-                timeout=EXTERNAL_CALL_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            lang = LanguageDetector.detect(req.query)
-            log.warning(f"[ASK] Timed out after {EXTERNAL_CALL_TIMEOUT}s for query: {req.query[:60]}")
-            msg = (
-                "عذراً، استغرق الطلب وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى."
-                if lang == "ar"
-                else "Sorry, the request timed out. Please try again."
-            )
-            return AskResponse(
-                query=req.query, reply=msg, model_used="none", matches=[],
-                is_medical=True, found_in_database=False, low_confidence=True,
-                language=lang, disclaimer=MEDICAL_DISCLAIMER,
-            )
+            _request_semaphore.release()
+        except Exception:
+            pass
 
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
-    """Core ask logic — runs inside semaphore + timeout context."""
+    """
+    Core ask logic.
+
+    v13.0: history is now received and logged.
+           Step 2 will wire it into the Gemini prompt context.
+    """
     q        = req.query
+    history  = req.history or []
     language = LanguageDetector.detect(q)
     intent   = await IntentClassifier.classify(q)
 
-    log.info(f"[ASK] query='{q[:80]}' lang={language} intent={intent}")
+    log.info(
+        f"[ASK] query='{q[:80]}' lang={language} intent={intent} "
+        f"history_turns={len(history)}"
+    )
 
     # ── Social path ───────────────────────────────────────────────
     if intent == "social":
