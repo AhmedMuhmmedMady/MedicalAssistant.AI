@@ -33,6 +33,7 @@ Or single-worker uvicorn:
 
 # ── Unbuffered output must come first for Railway log visibility ──
 import os
+
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
@@ -71,9 +72,9 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────
 # Environment
 # ──────────────────────────────────────────────────────────────────
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-INDEX_NAME       = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
+INDEX_NAME = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
 
 # v13.1: explicit namespace control — empty string = default namespace
 # Set PINECONE_NAMESPACE in env if your vectors were upserted with a namespace.
@@ -81,19 +82,19 @@ PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 
 # v13.2: Using SCORE_THRESHOLD env var for stricter filtering.
 # Default 0.45 prevents semantically irrelevant matches (e.g., genetic diseases for simple symptoms).
-MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.45"))
+MIN_CONFIDENCE = float(os.getenv("SCORE_THRESHOLD", "0.45"))
 
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
-MAX_IMAGE_MB     = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
-MAX_IMAGE_BYTES  = MAX_IMAGE_MB * 1024 * 1024
+MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
+MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 
 # v13.2: Pinecone query configuration
-TOP_K             = int(os.getenv("TOP_K", "7"))
-MAX_RETRIES       = int(os.getenv("MAX_RETRIES", "3"))
-RETRY_DELAY       = float(os.getenv("RETRY_DELAY", "1.5"))
+TOP_K = int(os.getenv("TOP_K", "7"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.5"))
 
-EMBEDDING_BACKEND  = os.getenv("EMBEDDING_BACKEND", "local").lower()
-EMBED_MODEL        = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
 
 # How many /ask requests run concurrently before returning 503.
@@ -133,6 +134,7 @@ _rate_limit_lock = threading.Lock()
 _RATE_LIMIT_REQUESTS = 10
 _RATE_LIMIT_WINDOW = 60  # seconds
 
+
 def _check_rate_limit(ip: str) -> bool:
     """Check if IP has exceeded rate limit. Returns True if allowed."""
     now = _time.time()
@@ -147,12 +149,13 @@ def _check_rate_limit(ip: str) -> bool:
             return True
         return False
 
+
 # ──────────────────────────────────────────────────────────────────
 # Lazy SDK getters  (imports happen here, NEVER at module level)
 # ──────────────────────────────────────────────────────────────────
 
 _pinecone_index = None
-_pinecone_lock  = threading.Lock()
+_pinecone_lock = threading.Lock()
 
 
 def _init_pinecone():
@@ -176,7 +179,7 @@ async def get_index():
 
 
 _gemini_client = None
-_gemini_lock   = threading.Lock()
+_gemini_lock = threading.Lock()
 
 
 def _init_gemini():
@@ -246,6 +249,7 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
     "cold", "flu", "runny", "nose", "sneeze", "congestion",
 })
 
+
 # ──────────────────────────────────────────────────────────────────
 # Embedding Backends  (all async-safe via threadpool)
 # ──────────────────────────────────────────────────────────────────
@@ -285,7 +289,7 @@ class _GeminiEmbedder:
 
 class _LocalEmbedder:
     _instance: Any = None
-    _lock           = threading.Lock()
+    _lock = threading.Lock()
     _load_error: Optional[str] = None
 
     @classmethod
@@ -307,7 +311,7 @@ class _LocalEmbedder:
                             model = model.to(_torch.device("cpu"))
                         except ImportError:
                             pass
-                        log.info(f"✅ SentenceTransformer ready in {time.perf_counter()-t0:.2f}s")
+                        log.info(f"✅ SentenceTransformer ready in {time.perf_counter() - t0:.2f}s")
                         cls._instance = model
                     except Exception as exc:
                         cls._load_error = str(exc)
@@ -522,18 +526,18 @@ class KnowledgeBaseService:
     async def search(self, query: str, top_k: int = None) -> List[KnowledgeMatch]:
         if top_k is None:
             top_k = TOP_K
-        
+
         # v13.4: Log query text for debugging
         log.info(f"[KnowledgeBase] Search query: '{query[:100]}'")
-        
+
         try:
             vector = await EmbeddingRouter.encode(query)
         except EmbeddingRouter.EmbeddingUnavailableError as exc:
             log.error(f"[KnowledgeBase] Embedding failed: {exc}")
             # v13.4: Return empty list instead of crashing
             return []
-        
-        index  = await get_index()
+
+        index = await get_index()
 
         # v13.4: Vector dimension safety check with graceful fallback
         expected_dim = 384 if EMBEDDING_BACKEND == "local" else 768
@@ -551,12 +555,12 @@ class KnowledgeBaseService:
             f"index='{INDEX_NAME}' "
             f"namespace='{PINECONE_NAMESPACE or '<default>'}' "
             f"backend={EMBEDDING_BACKEND} "
-            f"model={EMBED_MODEL if EMBEDDING_BACKEND=='local' else GEMINI_EMBED_MODEL}"
+            f"model={EMBED_MODEL if EMBEDDING_BACKEND == 'local' else GEMINI_EMBED_MODEL}"
         )
 
         last_exc: Optional[Exception] = None
         start_time = time.perf_counter()
-        
+
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
                 # v13.4: Always include namespace (default to empty string)
@@ -606,15 +610,15 @@ class KnowledgeBaseService:
         # v13.4: Simplified filtering - use confidence threshold only
         # Removed over-aggressive keyword filtering that was removing valid matches
         pre_filter = MIN_CONFIDENCE
-        
+
         matches = []
         filtered_count = 0
-        
+
         for m in results.matches:
             if m.score < pre_filter:
                 filtered_count += 1
                 continue
-            
+
             meta = m.metadata or {}
             matches.append(KnowledgeMatch(
                 question=meta.get("question", ""),
@@ -622,7 +626,7 @@ class KnowledgeBaseService:
                 confidence=round(float(m.score), 4),
                 category=meta.get("category", "General"),
             ))
-        
+
         log.info(
             f"[KnowledgeBase] Filter summary: pre_filter={filtered_count} kept={len(matches)}"
         )
@@ -703,8 +707,8 @@ class PromptBuilder:
     )
 
     def build(self, ctx: QueryContext) -> str:
-        lang      = ctx.language
-        system    = self._SYSTEM_AR    if lang == "ar" else self._SYSTEM_EN
+        lang = ctx.language
+        system = self._SYSTEM_AR if lang == "ar" else self._SYSTEM_EN
         structure = self._STRUCTURE_AR if lang == "ar" else self._STRUCTURE_EN
 
         context_parts = []
@@ -722,11 +726,11 @@ class PromptBuilder:
                 f"A: {m.answer}"
             )
 
-        sep            = "━" * 50
-        context_block  = f"\n\n{sep}\n".join(context_parts)
-        label_context  = "📋 قاعدة المعرفة الطبية:" if lang == "ar" else "📋 Medical Knowledge Base:"
-        label_question = "🧑‍⚕️ سؤال المريض:"       if lang == "ar" else "🧑‍⚕️ Patient Question:"
-        label_answer   = "الإجابة:"                  if lang == "ar" else "Answer:"
+        sep = "━" * 50
+        context_block = f"\n\n{sep}\n".join(context_parts)
+        label_context = "📋 قاعدة المعرفة الطبية:" if lang == "ar" else "📋 Medical Knowledge Base:"
+        label_question = "🧑‍⚕️ سؤال المريض:" if lang == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer = "الإجابة:" if lang == "ar" else "Answer:"
 
         return (
             f"{system}\n\n"
@@ -882,7 +886,7 @@ class GeminiService:
         )
 
         b64_data = base64.b64encode(image_bytes).decode("utf-8")
-        types    = _gemini_types()
+        types = _gemini_types()
 
         for model_name in GEMINI_VISION_MODELS:
             content_variants = [
@@ -898,12 +902,12 @@ class GeminiService:
             for contents in content_variants:
                 try:
                     log.info(f"Vision analyze — trying model: {model_name}")
-                    resp  = _get_gemini_sync().models.generate_content(
+                    resp = _get_gemini_sync().models.generate_content(
                         model=model_name,
                         contents=contents,
                         config=self._make_config(temperature=0.1, max_tokens=4096),
                     )
-                    raw   = resp.text.strip()
+                    raw = resp.text.strip()
 
                     # ── Hardened JSON extraction ──────────────────
                     clean = re.sub(
@@ -918,8 +922,8 @@ class GeminiService:
                         clean = clean[brace:]
 
                     try:
-                        parsed   = json.loads(clean)
-                        status   = str(parsed.get("status", "success"))
+                        parsed = json.loads(clean)
+                        status = str(parsed.get("status", "success"))
                         analysis = parsed.get("analysis", "")
                         if isinstance(analysis, dict):
                             analysis = analysis.get("analysis") or json.dumps(
@@ -953,7 +957,7 @@ class GeminiService:
                                         elif char == "}":
                                             brace_count -= 1
                                             if brace_count == 0:
-                                                json_str = clean[start:i+1]
+                                                json_str = clean[start:i + 1]
                                                 parsed = _json.loads(json_str)
                                                 status = str(parsed.get("status", "success"))
                                                 analysis = parsed.get("analysis", "")
@@ -963,7 +967,8 @@ class GeminiService:
                                                     )
                                                 if not isinstance(analysis, str):
                                                     analysis = _json.dumps(analysis, ensure_ascii=False, indent=2)
-                                                log.info(f"Vision succeeded (partial JSON) — model: {model_name}, status: {status}")
+                                                log.info(
+                                                    f"Vision succeeded (partial JSON) — model: {model_name}, status: {status}")
                                                 return status, analysis.strip(), model_name
                         except Exception:
                             pass
@@ -1002,9 +1007,9 @@ state = AppState()
 async def lifespan(app: FastAPI):
     global _request_semaphore
     log.info("🚀 Sila v13.1 — zero-SDK boot, async-safe runtime.")
-    _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    _request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     state.knowledge_base = KnowledgeBaseService()
-    state.gemini         = GeminiService()
+    state.gemini = GeminiService()
     state.prompt_builder = PromptBuilder()
     log.info(
         f"✅ Boot complete — concurrency={MAX_CONCURRENT_REQUESTS} "
@@ -1051,9 +1056,9 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 @app.get("/")
 def root():
     return {
-        "name":      "Sila — Medical AI Assistant",
-        "version":   "13.2.0",
-        "status":    "running",
+        "name": "Sila — Medical AI Assistant",
+        "version": "13.2.0",
+        "status": "running",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
     }
 
@@ -1092,7 +1097,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
         await _request_semaphore.acquire()
     except Exception:
         lang = LanguageDetector.detect(req.query)
-        msg  = (
+        msg = (
             "الخادم مشغول حالياً. يرجى المحاولة بعد لحظات."
             if lang == "ar"
             else "Server is busy. Please try again in a moment."
@@ -1125,10 +1130,10 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
-    q        = req.query
-    history  = req.history or []
+    q = req.query
+    history = req.history or []
     language = LanguageDetector.detect(q)
-    intent   = await IntentClassifier.classify(q)
+    intent = await IntentClassifier.classify(q)
 
     log.info(
         f"[ASK] query='{q[:80]}' lang={language} intent={intent} "
@@ -1177,7 +1182,8 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
         log.info(f"[ASK] RAG success — model={model_used} top={ctx.best_confidence:.4f} n={len(matches)}")
         return AskResponse(
             query=q, reply=reply, model_used=model_used,
-            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for m in matches],
+            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for
+                     m in matches],
             is_medical=True, found_in_database=True, low_confidence=False,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
@@ -1187,7 +1193,8 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
         reply = state.prompt_builder.no_data_response(language)
         return AskResponse(
             query=q, reply=reply, model_used="none",
-            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for m in matches],
+            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for
+                     m in matches],
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
