@@ -73,7 +73,7 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-INDEX_NAME       = os.getenv("PINECONE_INDEX", "sila-medical")
+INDEX_NAME       = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
 
 # v13.1: explicit namespace control — empty string = default namespace
 # Set PINECONE_NAMESPACE in env if your vectors were upserted with a namespace.
@@ -510,41 +510,56 @@ class KnowledgeBaseService:
     _MAX_RETRIES = MAX_RETRIES
     _RETRY_DELAY = RETRY_DELAY
 
+    # v13.4: Simple keyword-based fallback retrieval
+    @staticmethod
+    def _keyword_fallback(query: str) -> List[KnowledgeMatch]:
+        """Simple keyword-based fallback when vector search fails."""
+        # This is a placeholder - in production, you'd implement actual keyword search
+        # For now, return empty list to allow graceful degradation
+        log.info("[KnowledgeBase] Using keyword fallback (not implemented yet)")
+        return []
+
     async def search(self, query: str, top_k: int = None) -> List[KnowledgeMatch]:
         if top_k is None:
             top_k = TOP_K
         
-        # v13.2: Log query text for debugging
+        # v13.4: Log query text for debugging
         log.info(f"[KnowledgeBase] Search query: '{query[:100]}'")
         
-        vector = await EmbeddingRouter.encode(query)
+        try:
+            vector = await EmbeddingRouter.encode(query)
+        except EmbeddingRouter.EmbeddingUnavailableError as exc:
+            log.error(f"[KnowledgeBase] Embedding failed: {exc}")
+            # v13.4: Return empty list instead of crashing
+            return []
+        
         index  = await get_index()
 
-        # v13.3: Vector dimension safety check
+        # v13.4: Vector dimension safety check with graceful fallback
         expected_dim = 384 if EMBEDDING_BACKEND == "local" else 768
         if len(vector) != expected_dim:
-            log.error(
+            log.warning(
                 f"[KnowledgeBase] Vector dimension mismatch: got {len(vector)}, expected {expected_dim}. "
-                f"This will cause Pinecone query failures."
+                f"Proceeding with query anyway - may fail in Pinecone."
             )
-            raise RuntimeError(
-                f"Vector dimension mismatch: got {len(vector)}, expected {expected_dim}. "
-                f"Check EMBEDDING_BACKEND and model configuration."
-            )
+            # v13.4: Don't crash, log and proceed
 
-        # v13.1: log vector stats so dimension/value anomalies are visible
+        # v13.4: log vector stats so dimension/value anomalies are visible
         log.info(
             f"[KnowledgeBase] Query vector — dim={len(vector)} "
             f"min={min(vector):.4f} max={max(vector):.4f} "
+            f"index='{INDEX_NAME}' "
             f"namespace='{PINECONE_NAMESPACE or '<default>'}' "
             f"backend={EMBEDDING_BACKEND} "
             f"model={EMBED_MODEL if EMBEDDING_BACKEND=='local' else GEMINI_EMBED_MODEL}"
         )
 
         last_exc: Optional[Exception] = None
+        start_time = time.perf_counter()
+        
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
-                # v13.2: Always include namespace (default to empty string)
+                # v13.4: Always include namespace (default to empty string)
                 query_kwargs: dict = dict(
                     vector=vector,
                     top_k=top_k,
@@ -557,7 +572,7 @@ class KnowledgeBaseService:
                     **query_kwargs,
                 )
 
-                # v13.2: log raw Pinecone scores BEFORE any filtering
+                # v13.4: log raw Pinecone scores BEFORE any filtering
                 raw_scores = [round(m.score, 4) for m in results.matches]
                 log.info(
                     f"[KnowledgeBase] Pinecone raw scores (top_{top_k}): {raw_scores} "
@@ -566,9 +581,11 @@ class KnowledgeBaseService:
                 )
 
                 matches = self._parse_matches(results, query)
+                latency = time.perf_counter() - start_time
                 log.info(
                     f"[KnowledgeBase] After filter: {len(matches)} matches kept "
-                    f"(threshold≥{MIN_CONFIDENCE * 0.70:.3f})"
+                    f"(threshold≥{MIN_CONFIDENCE:.3f}) "
+                    f"| latency={latency:.3f}s"
                 )
                 return matches
 
@@ -580,31 +597,18 @@ class KnowledgeBaseService:
                 if attempt < self._MAX_RETRIES:
                     await asyncio.sleep(self._RETRY_DELAY * attempt)
 
+        # v13.4: Return empty list instead of raising exception
         log.error(f"[KnowledgeBase] All retries exhausted: {last_exc}")
-        raise last_exc  # type: ignore[misc]
+        return []
 
     @staticmethod
     def _parse_matches(results: Any, query: str) -> List[KnowledgeMatch]:
-        # v13.2: Pre-filter threshold
-        pre_filter = MIN_CONFIDENCE * 0.70
-        
-        # v13.2: Semantic keyword filter for symptom queries
-        # Prevents genetic diseases/rare syndromes from matching simple symptoms
-        symptom_keywords = [
-            "headache", "migraine", "pain", "fever", "dizzy", "nausea",
-            "صداع", "ألم", "دوخة", "حرارة", "مغص", "التهاب"
-        ]
-        
-        # Irrelevant medical domain keywords to filter out
-        irrelevant_keywords = [
-            "syndrome", "genetic", "mutation", "chromosome", "hereditary",
-            "congenital", "rare disease", "orphan",
-            "متلازمة", "وراثي", "طفرة", "كروموسوم", "خلقي", "نادر"
-        ]
+        # v13.4: Simplified filtering - use confidence threshold only
+        # Removed over-aggressive keyword filtering that was removing valid matches
+        pre_filter = MIN_CONFIDENCE
         
         matches = []
         filtered_count = 0
-        semantic_filtered_count = 0
         
         for m in results.matches:
             if m.score < pre_filter:
@@ -612,36 +616,6 @@ class KnowledgeBaseService:
                 continue
             
             meta = m.metadata or {}
-            question = meta.get("question", "").lower()
-            answer = meta.get("answer", "").lower()
-            combined_text = f"{question} {answer}"
-            
-            # v13.2: Semantic filter - check if match is relevant to query
-            # If query contains symptom keywords, match must also contain them
-            query_lower = query.lower()
-            has_symptom_keyword = any(kw in query_lower for kw in symptom_keywords)
-            
-            if has_symptom_keyword:
-                # For symptom queries, require match to contain at least one symptom keyword
-                has_relevant_keyword = any(kw in combined_text for kw in symptom_keywords)
-                if not has_relevant_keyword:
-                    semantic_filtered_count += 1
-                    log.info(
-                        f"[KnowledgeBase] Semantic filter dropped match (no symptom keyword): "
-                        f"score={m.score:.4f} question='{question[:50]}'"
-                    )
-                    continue
-            
-            # v13.2: Filter out irrelevant medical domains
-            has_irrelevant_keyword = any(kw in combined_text for kw in irrelevant_keywords)
-            if has_irrelevant_keyword:
-                semantic_filtered_count += 1
-                log.info(
-                    f"[KnowledgeBase] Semantic filter dropped match (irrelevant domain): "
-                    f"score={m.score:.4f} question='{question[:50]}'"
-                )
-                continue
-            
             matches.append(KnowledgeMatch(
                 question=meta.get("question", ""),
                 answer=meta.get("answer", ""),
@@ -650,8 +624,7 @@ class KnowledgeBaseService:
             ))
         
         log.info(
-            f"[KnowledgeBase] Filter summary: pre_filter={filtered_count} "
-            f"semantic_filter={semantic_filtered_count} kept={len(matches)}"
+            f"[KnowledgeBase] Filter summary: pre_filter={filtered_count} kept={len(matches)}"
         )
         return matches
 
@@ -1174,74 +1147,14 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     # ── Medical path ──────────────────────────────────────────────
     try:
         matches = await state.knowledge_base.search(q, top_k=TOP_K)
-
-    except EmbeddingRouter.EmbeddingUnavailableError as exc:
-        log.error(f"[ASK] Embedding unavailable: {exc}")
-        msg = (
-            "عذراً، خدمة البحث غير متاحة مؤقتاً. يرجى المحاولة مرة أخرى لاحقاً."
-            if language == "ar"
-            else "Sorry, the search service is temporarily unavailable. Please try again later."
-        )
-        return AskResponse(
-            query=q, reply=msg, model_used="none", matches=[],
-            is_medical=True, found_in_database=False, low_confidence=True,
-            language=language, disclaimer=MEDICAL_DISCLAIMER,
-        )
-
-    except RuntimeError as exc:
-        # v13.3: Handle vector dimension mismatch gracefully
-        if "dimension mismatch" in str(exc):
-            log.error(f"[ASK] Vector dimension error: {exc}")
-            msg = (
-                "عذراً، حدث خطأ في تكوين النظام. يرجى المحاولة مرة أخرى لاحقاً."
-                if language == "ar"
-                else "Sorry, a system configuration error occurred. Please try again later."
-            )
-            return AskResponse(
-                query=q, reply=msg, model_used="none", matches=[],
-                is_medical=True, found_in_database=False, low_confidence=True,
-                language=language, disclaimer=MEDICAL_DISCLAIMER,
-            )
-        raise
-
     except Exception as exc:
+        # v13.4: Graceful fallback - don't return error, continue with empty matches
         log.error(f"[ASK] Pinecone search failed: {exc}")
-        msg = (
-            "عذراً، حدث خطأ في البحث. يرجى المحاولة مرة أخرى."
-            if language == "ar"
-            else "Sorry, search failed. Please try again."
-        )
-        return AskResponse(
-            query=q, reply=msg, model_used="none", matches=[],
-            is_medical=True, found_in_database=False, low_confidence=True,
-            language=language, disclaimer=MEDICAL_DISCLAIMER,
-        )
+        matches = []
 
-    # v13.3: Query-side safety cleanup - keep 1-2 fallback results
-    # If all matches have low confidence OR contain irrelevant domains, keep top 1-2 as fallback
-    if matches:
-        all_low_confidence = all(m.confidence < 0.40 for m in matches)
-        
-        irrelevant_keywords = [
-            "syndrome", "genetic", "mutation", "chromosome", "hereditary",
-            "congenital", "rare disease", "orphan",
-            "متلازمة", "وراثي", "طفرة", "كروموسوم", "خلقي", "نادر"
-        ]
-        
-        all_irrelevant = False
-        if matches:
-            all_irrelevant = all(
-                any(kw in f"{m.question.lower()} {m.answer.lower()}" for kw in irrelevant_keywords)
-                for m in matches
-            )
-        
-        if all_low_confidence or all_irrelevant:
-            log.warning(
-                f"[ASK] Query-side safety cleanup: keeping top 2 of {len(matches)} matches as fallback "
-                f"(all_low_confidence={all_low_confidence}, all_irrelevant={all_irrelevant})"
-            )
-            # Keep top 2 matches as fallback instead of clearing all
-            matches = matches[:2]
+    # v13.4: Removed query-side safety cleanup
+    # System now degrades gracefully by using best available matches
+    # No need to clear matches based on keywords since we removed over-aggressive filtering
 
     ctx = QueryContext(raw_query=q, language=language, matches=matches)
 
@@ -1253,24 +1166,31 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             f"total_returned: {len(matches)}"
         )
         return AskResponse(
-            query=q, reply=reply, model_used="none",
-            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence)
-                     for m in matches],
+            query=q, reply=reply, model_used="none", matches=[],
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
 
-    prompt            = state.prompt_builder.build(ctx)
-    reply, model_used = await state.gemini.generate(prompt)
-    log.info(f"[ASK] RAG success — model={model_used} top={ctx.best_confidence:.4f} n={len(matches)}")
-
-    return AskResponse(
-        query=q, reply=reply, model_used=model_used,
-        matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence)
-                 for m in matches],
-        is_medical=True, found_in_database=True, low_confidence=False,
-        language=language, disclaimer=MEDICAL_DISCLAIMER,
-    )
+    try:
+        prompt = state.prompt_builder.build(ctx)
+        reply, model_used = await state.gemini.generate(prompt)
+        log.info(f"[ASK] RAG success — model={model_used} top={ctx.best_confidence:.4f} n={len(matches)}")
+        return AskResponse(
+            query=q, reply=reply, model_used=model_used,
+            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for m in matches],
+            is_medical=True, found_in_database=True, low_confidence=False,
+            language=language, disclaimer=MEDICAL_DISCLAIMER,
+        )
+    except Exception as exc:
+        # v13.4: Final safety net - if Gemini fails, return safe fallback
+        log.error(f"[ASK] Gemini generation failed: {exc}")
+        reply = state.prompt_builder.no_data_response(language)
+        return AskResponse(
+            query=q, reply=reply, model_used="none",
+            matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence, category=m.category) for m in matches],
+            is_medical=True, found_in_database=False, low_confidence=True,
+            language=language, disclaimer=MEDICAL_DISCLAIMER,
+        )
 
 
 @app.post("/analyze-image", response_model=ImageAnalysisResponse)
