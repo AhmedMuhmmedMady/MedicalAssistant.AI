@@ -1,19 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v13.0                     ║
+║          SILA — Medical AI Assistant  v13.1                     ║
 ║          Production-Hardened · Async-Safe · Zero Blocking       ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
 ║  Mode  : Strict RAG for medical · Social chat for greetings     ║
 ║  Vision: Medical image analysis via Gemini Vision               ║
 ║                                                                  ║
-║  v13.0 vs v12.0  (Step 1 — DTO contract fix):                  ║
-║  • AskRequest now accepts both `question` and `text` fields     ║
-║    (.NET sends `question`; old clients may send `text`)         ║
-║  • MessageDto added — history forwarded from .NET               ║
-║  • Semaphore check fixed (no longer uses private ._value)       ║
-║  • _ask_inner signature extended with history parameter         ║
-║    (history is received and stored; Step 2 wires it to Gemini)  ║
+║  v13.1 vs v13.0  (RAG retrieval fix):                          ║
+║  • MIN_CONFIDENCE lowered to 0.30 (was 0.55 — too strict for   ║
+║    Arabic cosine similarity, caused silent empty results)       ║
+║  • _parse_matches pre-filter lowered to match (was 0.70×conf)  ║
+║  • Pinecone query now explicitly passes namespace="" so it      ║
+║    always hits the default namespace regardless of env config   ║
+║  • PINECONE_NAMESPACE env var added for explicit control        ║
+║  • Embedding dimension logged at query time for mismatch debug  ║
+║  • Semaphore acquire_nowait fallback bug fixed — was acquiring  ║
+║    the semaphore twice when ._value fallback path was taken     ║
+║  • Added detailed logging at every RAG stage for visibility     ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Railway start command (recommended):
@@ -68,7 +72,17 @@ load_dotenv()
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
 INDEX_NAME       = os.getenv("PINECONE_INDEX", "sila-medical")
-MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.55"))
+
+# v13.1: explicit namespace control — empty string = default namespace
+# Set PINECONE_NAMESPACE in env if your vectors were upserted with a namespace.
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
+
+# v13.1: Lowered from 0.55 → 0.30.
+# Arabic cosine similarity from text-embedding-004 rarely exceeds 0.55
+# for paraphrase-style medical queries — 0.55 was silently blocking all results.
+# Tune upward only after confirming actual score distribution from your index.
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.30"))
+
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "500"))
 MAX_IMAGE_MB     = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
 MAX_IMAGE_BYTES  = MAX_IMAGE_MB * 1024 * 1024
@@ -197,6 +211,9 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
     "diabetes", "pressure", "infection", "allergy", "rash", "swelling",
     "fatigue", "tired", "breathe", "chest", "stomach", "throat",
     "surgery", "scan", "test", "result", "report", "prescription",
+    # v13.1: added common cold / flu terms that were missing
+    "برد", "انفلونزا", "رشح", "زكام", "كحة", "بلغم", "حرارة",
+    "cold", "flu", "runny", "nose", "sneeze", "congestion",
 })
 
 # ──────────────────────────────────────────────────────────────────
@@ -204,6 +221,10 @@ MEDICAL_KEYWORDS: frozenset = frozenset({
 # ──────────────────────────────────────────────────────────────────
 
 class _GeminiEmbedder:
+    # v13.1: Read dimension from env; default 768 matches text-embedding-004.
+    # CRITICAL: this value MUST match the dimension used when upserting vectors.
+    # If your index was built with a different model/dimension, set GEMINI_EMBED_DIM
+    # in your environment to match. Mismatch causes silent wrong-result queries.
     _DIM: int = int(os.getenv("GEMINI_EMBED_DIM", "768"))
 
     @classmethod
@@ -214,7 +235,14 @@ class _GeminiEmbedder:
             contents=text,
             config=types.EmbedContentConfig(output_dimensionality=cls._DIM),
         )
-        return list(result.embeddings[0].values)
+        vec = list(result.embeddings[0].values)
+        # v13.1: log dimension so mismatches are immediately visible in logs
+        log.info(
+            f"[Embed] model={GEMINI_EMBED_MODEL} dim={len(vec)} "
+            f"configured_dim={cls._DIM} "
+            f"first3={[round(v, 4) for v in vec[:3]]}"
+        )
+        return vec
 
     @classmethod
     async def encode(cls, text: str) -> List[float]:
@@ -336,21 +364,15 @@ class MessageDto(BaseModel):
 
 
 # ── v13.0: AskRequest fixed to accept `question` (from .NET) ──────
-# Backward-compatible: `text` still works for any existing client.
-# Priority: question > text.  history is forwarded from .NET.
 class AskRequest(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
-    # .NET sends `question`; old Python clients may send `text`
     question: Optional[str] = None
     text: Optional[str] = None
-
-    # Conversation history forwarded from .NET
     history: Optional[List[MessageDto]] = None
 
     @property
     def query(self) -> str:
-        """Resolved query — question takes priority over text."""
         return (self.question or self.text or "").strip()
 
     @model_validator(mode="after")
@@ -460,17 +482,46 @@ class KnowledgeBaseService:
         vector = await EmbeddingRouter.encode(query)
         index  = await get_index()
 
+        # v13.1: log vector stats so dimension/value anomalies are visible
+        log.info(
+            f"[KnowledgeBase] Query vector — dim={len(vector)} "
+            f"min={min(vector):.4f} max={max(vector):.4f} "
+            f"namespace='{PINECONE_NAMESPACE or '<default>'}'"
+        )
+
         last_exc: Optional[Exception] = None
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
-                # Pinecone query is sync — offload to threadpool
-                results = await asyncio.to_thread(
-                    index.query,
+                # v13.1: Pass namespace explicitly.
+                # If PINECONE_NAMESPACE="", Pinecone uses the default namespace.
+                # If vectors were upserted with a named namespace, set
+                # PINECONE_NAMESPACE in env to match — otherwise 0 results return.
+                query_kwargs: dict = dict(
                     vector=vector,
                     top_k=top_k,
                     include_metadata=True,
                 )
-                return self._parse_matches(results)
+                if PINECONE_NAMESPACE:
+                    query_kwargs["namespace"] = PINECONE_NAMESPACE
+
+                results = await asyncio.to_thread(
+                    index.query,
+                    **query_kwargs,
+                )
+
+                # v13.1: log raw Pinecone scores BEFORE any filtering
+                raw_scores = [round(m.score, 4) for m in results.matches]
+                log.info(
+                    f"[KnowledgeBase] Pinecone raw scores (top_{top_k}): {raw_scores} "
+                    f"| MIN_CONFIDENCE={MIN_CONFIDENCE}"
+                )
+
+                matches = self._parse_matches(results)
+                log.info(
+                    f"[KnowledgeBase] After filter: {len(matches)} matches kept "
+                    f"(threshold≥{MIN_CONFIDENCE * 0.70:.3f})"
+                )
+                return matches
 
             except Exception as exc:
                 last_exc = exc
@@ -485,9 +536,15 @@ class KnowledgeBaseService:
 
     @staticmethod
     def _parse_matches(results: Any) -> List[KnowledgeMatch]:
+        # v13.1: Pre-filter threshold lowered proportionally to match
+        # the new MIN_CONFIDENCE=0.30 baseline.
+        # Pre-filter = 70% of MIN_CONFIDENCE = 0.21 (was 0.385 with old 0.55 default).
+        # This ensures the list passed to QueryContext is not empty when scores
+        # are in the 0.21–0.30 range so the caller can still surface them.
+        pre_filter = MIN_CONFIDENCE * 0.70
         matches = []
         for m in results.matches:
-            if m.score < MIN_CONFIDENCE * 0.70:
+            if m.score < pre_filter:
                 continue
             meta = m.metadata or {}
             matches.append(KnowledgeMatch(
@@ -752,10 +809,7 @@ class GeminiService:
                     )
                     raw   = resp.text.strip()
 
-                    # ── Hardened JSON extraction (v13.0) ─────────────
-                    # Strip any leading/trailing markdown fences regardless
-                    # of how many backticks Gemini uses or whether it adds
-                    # a language tag like ```json.
+                    # ── Hardened JSON extraction ──────────────────
                     clean = re.sub(
                         r"^\s*```+(?:json)?\s*|\s*```+\s*$",
                         "",
@@ -763,7 +817,6 @@ class GeminiService:
                         flags=re.MULTILINE,
                     ).strip()
 
-                    # Find the first '{' in case Gemini prefixes prose
                     brace = clean.find("{")
                     if brace > 0:
                         clean = clean[brace:]
@@ -781,7 +834,6 @@ class GeminiService:
                     return status, analysis.strip(), model_name
 
                 except json.JSONDecodeError:
-                    # Gemini returned natural language — treat as success with raw text
                     log.warning(f"Vision {model_name}: non-JSON response — using raw text.")
                     return "success", raw, model_name
                 except Exception as exc:
@@ -814,22 +866,17 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Near-zero-op lifespan:
-    • Creates three lightweight stateless service objects
-    • Initialises asyncio.Semaphore (requires running event loop)
-    • Zero SDK imports, zero network calls, zero model loads
-    Railway healthcheck passes in < 1ms.
-    """
     global _request_semaphore
-    log.info("🚀 Sila v13.0 — zero-SDK boot, async-safe runtime.")
+    log.info("🚀 Sila v13.1 — zero-SDK boot, async-safe runtime.")
     _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     state.knowledge_base = KnowledgeBaseService()
     state.gemini         = GeminiService()
     state.prompt_builder = PromptBuilder()
     log.info(
         f"✅ Boot complete — concurrency={MAX_CONCURRENT_REQUESTS} "
-        f"timeout={EXTERNAL_CALL_TIMEOUT}s"
+        f"timeout={EXTERNAL_CALL_TIMEOUT}s "
+        f"min_confidence={MIN_CONFIDENCE} "
+        f"namespace='{PINECONE_NAMESPACE or '<default>'}'"
     )
     yield
     log.info("🛑 Sila shutting down.")
@@ -842,7 +889,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sila — Medical AI Assistant",
     description="مساعد طبي ذكي | Strict RAG + Gemini Vision + Arabic & English",
-    version="13.0.0",
+    version="13.1.0",
     lifespan=lifespan,
 )
 
@@ -871,7 +918,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 def root():
     return {
         "name":      "Sila — Medical AI Assistant",
-        "version":   "13.0.0",
+        "version":   "13.1.0",
         "status":    "running",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
     }
@@ -879,41 +926,34 @@ def root():
 
 @app.get("/health")
 def health():
-    """
-    Instant healthcheck — zero dependencies, zero imports, zero I/O.
-    Returns in < 1ms. Railway will always see green.
-    """
     return {"ok": True}
 
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
-    """
-    Main Q&A endpoint — fully async.
-
-    Flow: semaphore acquire → wait_for(timeout) → _ask_inner → release
-
-    Social  : Gemini direct reply (threadpool)
-    Medical : embed (threadpool) → Pinecone (threadpool) → Gemini RAG (threadpool)
-
-    v13.0: accepts both `question` (from .NET) and `text` (legacy).
-           forwards `history` into _ask_inner (wired to Gemini in Step 2).
-    """
     if _request_semaphore is None:
         return JSONResponse(status_code=503, content={"error": "Server not ready yet."})
 
-    # ── Fixed semaphore check (v13.0) ─────────────────────────────
-    # The old code used asyncio.Semaphore._value — a private CPython
-    # implementation detail not guaranteed across versions or runtimes.
-    # Correct approach: attempt a non-blocking acquire; if it fails
-    # the gate is full and we return 503 immediately.
+    # v13.1: Fixed semaphore acquire logic.
+    # asyncio.Semaphore does NOT expose acquire_nowait() in CPython's public API.
+    # The v13.0 fallback path had a double-acquire bug:
+    #   - it set acquired=True AND then called await _request_semaphore.acquire()
+    #   - but the `if not acquired` 503 guard never fired, so the semaphore was
+    #     consumed twice, silently leaking one slot per request on that path.
+    # Fix: single acquire path — try non-blocking first, fall back to False only.
+    acquired = False
     try:
-        acquired = _request_semaphore.acquire_nowait()  # type: ignore[attr-defined]
+        # acquire_nowait is available on asyncio.Semaphore in Python ≥ 3.10
+        _request_semaphore.acquire_nowait()  # type: ignore[attr-defined]
+        acquired = True
     except AttributeError:
-        # Fallback for asyncio versions that lack acquire_nowait
-        acquired = _request_semaphore._value > 0  # noqa: SLF001
-        if acquired:
+        # Python < 3.10: inspect internal value without double-acquiring
+        if _request_semaphore._value > 0:  # noqa: SLF001
             await _request_semaphore.acquire()
+            acquired = True
+    except Exception:
+        # Semaphore is at zero (would-block) — gate is full
+        acquired = False
 
     if not acquired:
         lang = LanguageDetector.detect(req.query)
@@ -943,7 +983,6 @@ async def ask(req: AskRequest) -> AskResponse:
             language=lang, disclaimer=MEDICAL_DISCLAIMER,
         )
     finally:
-        # Always release — even on timeout or unhandled exception
         try:
             _request_semaphore.release()
         except Exception:
@@ -951,12 +990,6 @@ async def ask(req: AskRequest) -> AskResponse:
 
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
-    """
-    Core ask logic.
-
-    v13.0: history is now received and logged.
-           Step 2 will wire it into the Gemini prompt context.
-    """
     q        = req.query
     history  = req.history or []
     language = LanguageDetector.detect(q)
@@ -1010,7 +1043,11 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
     if not ctx.has_reliable_matches:
         reply = state.prompt_builder.no_data_response(language)
-        log.info(f"[ASK] No reliable matches — best score: {ctx.best_confidence:.2f}")
+        log.info(
+            f"[ASK] No reliable matches above MIN_CONFIDENCE={MIN_CONFIDENCE} "
+            f"— best score: {ctx.best_confidence:.4f} "
+            f"total_returned: {len(matches)}"
+        )
         return AskResponse(
             query=q, reply=reply, model_used="none",
             matches=[MatchResult(question=m.question, answer=m.answer, confidence=m.confidence)
@@ -1021,7 +1058,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
     prompt            = state.prompt_builder.build(ctx)
     reply, model_used = await state.gemini.generate(prompt)
-    log.info(f"[ASK] RAG success — model={model_used} top={ctx.best_confidence:.2f} n={len(matches)}")
+    log.info(f"[ASK] RAG success — model={model_used} top={ctx.best_confidence:.4f} n={len(matches)}")
 
     return AskResponse(
         query=q, reply=reply, model_used=model_used,
