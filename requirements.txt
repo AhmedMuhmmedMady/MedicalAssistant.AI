@@ -1,17 +1,19 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-gunicorn==21.2.0
+gunicorn>=21.2.0
 
 python-dotenv==1.0.1
 pydantic==2.10.4
 
-google-genai==0.6.0
-pinecone-client==3.0.0
+google-genai>=0.6.0,<1.0.0
+pinecone>=5.0.0
 
-requests==2.32.3
 typing-extensions==4.12.2
-
-sentence-transformers==3.0.1
-torch>=2.1.0
-
 python-multipart==0.0.9
+
+sentence-transformers==2.7.0
+transformers==4.41.2
+torch==2.2.2
+scikit-learn==1.5.1
+scipy==1.14.0
+numpy==1.26.4
