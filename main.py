@@ -192,8 +192,8 @@ async def _encode_async(text: str) -> List[float]:
 # ──────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────
-GEMINI_TEXT_MODELS   = ["gemini-1.5-flash"]
-GEMINI_VISION_MODELS = ["gemini-1.5-flash"]
+GEMINI_TEXT_MODELS   = ["gemini-2.0-flash"]
+GEMINI_VISION_MODELS = ["gemini-2.0-flash"]
 
 ALLOWED_IMAGE_TYPES = frozenset({
     "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
@@ -1147,7 +1147,7 @@ def health():
 async def gemini_test():
     try:
         r = _get_gemini_sync().models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents="hello"
         )
         return {
