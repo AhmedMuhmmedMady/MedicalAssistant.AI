@@ -192,8 +192,8 @@ async def _encode_async(text: str) -> List[float]:
 # ──────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────
-GEMINI_TEXT_MODELS   = ["gemini-2.0-flash"]
-GEMINI_VISION_MODELS = ["gemini-2.0-flash"]
+GEMINI_TEXT_MODELS   = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
+GEMINI_VISION_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
 
 ALLOWED_IMAGE_TYPES = frozenset({
     "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
@@ -722,6 +722,101 @@ class KnowledgeBaseService:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Deterministic Medical Fallback (No AI Dependency)
+# ──────────────────────────────────────────────────────────────────
+def _generate_deterministic_fallback(query: str, language: str) -> str:
+    """Generate medical response WITHOUT AI - uses rules and patterns only."""
+    q_norm = _normalize_text(query)
+    
+    # 1. Extract possible causes from symptom patterns
+    possible_causes = []
+    for kw, cats in SYMPTOM_CATEGORY_MAP.items():
+        if _normalize_text(kw) in q_norm:
+            for cat in cats:
+                cause_map = {
+                    "respiratory": "Respiratory infection or inflammation",
+                    "cardiology": "Cardiovascular condition or circulation issue",
+                    "neurology": "Neurological condition or nerve issue",
+                    "gastroenterology": "Gastrointestinal issue or digestive problem",
+                    "dermatology": "Skin condition or allergic reaction",
+                    "orthopedic": "Musculoskeletal injury or joint issue",
+                    "general": "General medical condition",
+                    "pediatrics": "Pediatric condition",
+                    "urology": "Urinary or kidney issue",
+                    "ophthalmology": "Eye condition or vision issue",
+                    "psychology": "Psychological or emotional factor",
+                    "endocrinology": "Hormonal or metabolic issue",
+                    "gynecology": "Gynecological or reproductive issue",
+                    "dentistry": "Dental or oral health issue",
+                }
+                cause = cause_map.get(cat, "Medical condition")
+                if cause not in possible_causes:
+                    possible_causes.append(cause)
+    
+    # Limit to 3 causes
+    possible_causes = possible_causes[:3]
+    
+    # 2. Check for emergency red flags
+    red_flags = []
+    emergency_kws = EMERGENCY_KEYWORDS_AR if language == "ar" else EMERGENCY_KEYWORDS_EN
+    for kw in emergency_kws:
+        if kw.lower() in q.lower():
+            red_flags.append(kw)
+    
+    # 3. Determine specialty from symptoms
+    specialties = []
+    for kw, cats in SYMPTOM_CATEGORY_MAP.items():
+        if _normalize_text(kw) in q_norm:
+            for cat in cats:
+                if cat not in specialties:
+                    specialties.append(cat)
+    
+    specialty = specialties[0] if specialties else "general"
+    
+    # 4. Build response based on language
+    if language == "ar":
+        causes_text = "\n".join([f"→ {c}" for c in possible_causes]) if possible_causes else "→ حالة طبية عامة"
+        red_flags_text = "\n".join([f"→ {rf}" for rf in red_flags[:3]]) if red_flags else "لم يتم اكتشاف علامات خطر فورية"
+        
+        response = (
+            f"🔍 الأسباب المحتملة:\n{causes_text}\n\n"
+            f"🚨 علامات الخطر:\n{red_flags_text}\n\n"
+            f"❓ الأسئلة:\n"
+            f"→ كم مدة الأعراض؟\n"
+            f"→ ما هي شدة الأعراض؟\n"
+            f"→ هل هناك أعراض أخرى مصاحبة؟\n\n"
+            f"💊 النصائح:\n"
+            f"→ الحفاظ على الترطيب والراحة\n"
+            f"→ مراقبة الأعراض عن كثب\n"
+            f"→ تجنب الأدوية دون استشارة طبية\n\n"
+            f"🏥 التوصية:\n"
+            f"→ مراجعة طبيب {specialty} في أقرب وقت\n"
+            f"→ مستوى الإلحاح: متوسط"
+        )
+    else:
+        causes_text = "\n".join([f"→ {c}" for c in possible_causes]) if possible_causes else "→ General medical condition"
+        red_flags_text = "\n".join([f"→ {rf}" for rf in red_flags[:3]]) if red_flags else "No immediate red flags detected"
+        
+        response = (
+            f"🔍 Possible Causes:\n{causes_text}\n\n"
+            f"🚨 Red Flags:\n{red_flags_text}\n\n"
+            f"❓ Questions:\n"
+            f"→ How long have symptoms lasted?\n"
+            f"→ What is the severity?\n"
+            f"→ Are there other associated symptoms?\n\n"
+            f"💊 Advice:\n"
+            f"→ Maintain hydration and rest\n"
+            f"→ Monitor symptoms closely\n"
+            f"→ Avoid self-medication\n\n"
+            f"🏥 Recommendation:\n"
+            f"→ Consult a {specialty} specialist soon\n"
+            f"→ Urgency level: moderate"
+        )
+    
+    return response
+
+
+# ──────────────────────────────────────────────────────────────────
 # Prompt Builder  (unchanged from v15.0)
 # ──────────────────────────────────────────────────────────────────
 class PromptBuilder:
@@ -730,29 +825,61 @@ class PromptBuilder:
     _SYSTEM_AR = (
         "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
         "أسلوبك: دافئ واحترافي، كأنك طبيب خبير يشرح لمريضه بصدق واهتمام.\n\n"
-        "قواعد صارمة لا استثناء فيها:\n"
-        "١. استخدم فقط المعلومات المقدمة في قاعدة المعرفة أدناه.\n"
-        "٢. لا تستخدم أي معرفة خارجية أو افتراضات شخصية تحت أي ظرف.\n"
-        "٣. إذا كانت المعلومات غير كافية، قل بوضوح: "
-        "'معلوماتي محدودة في هذه الحالة، أنصح بمراجعة طبيب متخصص.'\n"
-        "٤. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات فقط.\n"
-        "٥. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
-        "٦. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
-        "٧. لغة الإجابة: عربية واضحة ومفهومة."
+        "قواعد صارمة لا استثناء فيها (أسلوب طبي واقعي):\n\n"
+        "١. 🚨 فحص علمات الخطر أولاً:\n"
+        "   - ألم صدر، صعوبة تنفس، إغماء، نزيف شديد\n"
+        "   - أعراض عصبية مفاجئة\n"
+        "   إذا وجدت → توصية عاجلة فوراً\n\n"
+        "٢. 🧠 التشخيص التفريقي (إلزامي):\n"
+        "   - قدّم 2-4 أسباب محتملة\n"
+        "   - رتبها حسب الاحتمالية\n"
+        "   - لكل سبب: تبرير طبي قصير\n"
+        "   - لا تُعطِ سبباً واحداً أبداً\n\n"
+        "٣. ❓ أسئلة توضيحية:\n"
+        "   - إذا كان التشخيص غير مؤكد\n"
+        "   - اسأل 1-3 أسئلة:\n"
+        "   - المدة، الشدة، الأعراض المصاحبة\n\n"
+        "٤. 💊 نصائح طبية آمنة فقط:\n"
+        "   - ترطيب، راحة، مراقبة الأعراض\n"
+        "   - لا اقتراحات أدوية قوية\n\n"
+        "٥. 🏥 توصية الطبيب:\n"
+        "   - متى ترى الطبيب\n"
+        "   - أي تخصص (قلب، عصبية، جهاز هضمي...)\n\n"
+        "٦. لغة احتمالية دائماً:\n"
+        "   - 'قد يشير إلى'، 'أسباب محتملة'\n"
+        "   - لا 'لديك X' (تشخيص نهائي ممنوع)\n\n"
+        "٧. استخدم المعلومات المقدمة في قاعدة المعرفة أدناه.\n"
+        "٨. لغة الإجابة: عربية واضحة ومفهومة."
     )
 
     _SYSTEM_EN = (
         "You are 'Sila', a trusted and empathetic medical AI assistant.\n"
         "Tone: warm, calm, and professionally precise.\n\n"
-        "Strict rules — no exceptions:\n"
-        "1. Use ONLY the information provided in the knowledge base context below.\n"
-        "2. NEVER use external knowledge or personal assumptions.\n"
-        "3. If the data is insufficient, clearly state: "
-        "'My knowledge is limited on this. Please consult a specialist.'\n"
-        "4. NEVER provide a definitive diagnosis — suggest possibilities only.\n"
-        "5. Flag any warning signs that require urgent care.\n"
-        "6. Always close by recommending a specialist consultation.\n"
-        "7. Respond in clear, professional English."
+        "Strict rules — no exceptions (doctor-like clinical reasoning):\n\n"
+        "1. 🚨 RED FLAGS CHECK FIRST:\n"
+        "   - Chest pain, breathing difficulty, fainting\n"
+        "   - Severe bleeding, sudden neurological symptoms\n"
+        "   If present → urgent recommendation immediately\n\n"
+        "2. 🧠 DIFFERENTIAL DIAGNOSIS (MANDATORY):\n"
+        "   - Provide 2-4 possible causes\n"
+        "   - Ranked by likelihood\n"
+        "   - Each with short medical reasoning\n"
+        "   - NEVER give a single cause\n\n"
+        "3. ❓ CLARIFYING QUESTIONS:\n"
+        "   - If diagnosis is uncertain\n"
+        "   - Ask 1-3 questions:\n"
+        "   - Duration, severity, associated symptoms\n\n"
+        "4. 💊 SAFE MEDICAL ADVICE ONLY:\n"
+        "   - Hydration, rest, monitoring symptoms\n"
+        "   - NO strong medication suggestions\n\n"
+        "5. 🏥 DOCTOR RECOMMENDATION:\n"
+        "   - When to see doctor\n"
+        "   - Which specialty (neurology, gastro, cardiology, etc.)\n\n"
+        "6. PROBABILISTIC LANGUAGE ALWAYS:\n"
+        "   - 'may indicate', 'possible causes'\n"
+        "   - NO 'you have X' (definitive diagnosis forbidden)\n\n"
+        "7. Use ONLY the information provided in the knowledge base context below.\n"
+        "8. Respond in clear, professional English."
     )
 
     _GEMINI_ONLY_AR = (
@@ -830,19 +957,35 @@ class PromptBuilder:
     )
 
     _STRUCTURE_AR = (
-        "رتّب إجابتك بهذا الشكل:\n\n"
-        "🔍 الأسباب المحتملة:\n→ اذكر الأسباب الأكثر احتمالاً\n\n"
-        "💊 التوصيات والخطوات العملية:\n→ ما يمكن للمريض فعله الآن\n\n"
-        "🏥 التخصص الطبي المناسب للمراجعة:\n→ اذكر التخصص المناسب\n\n"
-        "⚠️ علامات الخطر التي تستدعي الطوارئ فوراً:\n→ اذكرها إن وُجدت"
+        "رتّب إجابتك بهذا الشكل (إلزامي):\n\n"
+        "🔍 الأسباب المحتملة:\n"
+        "→ السبب 1 + التبرير الطبي\n"
+        "→ السبب 2 + التبرير الطبي\n"
+        "→ السبب 3 + التبرير الطبي\n\n"
+        "🚨 علامات الخطر:\n"
+        "→ القائمة أو 'لم يتم اكتشاف علامات خطر فورية'\n\n"
+        "❓ الأسئلة:\n"
+        "→ 1-3 أسئلة توضيحية\n\n"
+        "💊 النصائح:\n"
+        "→ توصيات آمنة فقط\n\n"
+        "🏥 التوصية:\n"
+        "→ نوع الطبيب + مستوى الإلحاح"
     )
 
     _STRUCTURE_EN = (
-        "Structure your response as follows:\n\n"
-        "🔍 Possible Causes:\n→ Based on the provided context\n\n"
-        "💊 Recommendations & Next Steps:\n→ Practical actions the patient can take\n\n"
-        "🏥 Recommended Medical Specialty:\n→ Which specialist to consult\n\n"
-        "⚠️ Warning Signs Requiring Immediate Emergency Care:\n→ List if present"
+        "Structure your response as follows (mandatory):\n\n"
+        "🔍 Possible Causes:\n"
+        "→ Cause 1 + reasoning\n"
+        "→ Cause 2 + reasoning\n"
+        "→ Cause 3 + reasoning\n\n"
+        "� Red Flags:\n"
+        "→ List or 'No immediate red flags detected'\n\n"
+        "❓ Questions:\n"
+        "→ 1-3 clarifying questions\n\n"
+        "💊 Advice:\n"
+        "→ Safe recommendations only\n\n"
+        "🏥 Recommendation:\n"
+        "→ Doctor type + urgency level"
     )
 
     _FALLBACK_AR = (
@@ -991,7 +1134,7 @@ class GeminiService:
     async def reply_social(self, query: str, language: str) -> Tuple[str, str]:
         return await asyncio.to_thread(self._reply_social_sync, query, language)
 
-    # ── RAG generation (improved retry) ────────────────────────────
+    # ── RAG generation (strict failover chain) ────────────────────────
     def _generate_sync(self, prompt: str) -> Tuple[str, str]:
         cache_key = hashlib.sha256(prompt.encode()).hexdigest()
         cached    = self._cache.get(cache_key)
@@ -999,25 +1142,37 @@ class GeminiService:
             log.info("[Gemini] ✅ Cache hit")
             return cached
 
+        # Strict fallback chain: try each model in order
         for model in GEMINI_TEXT_MODELS:
-            for attempt in range(1, 3):   # 2 attempts per model
-                try:
-                    log.info(f"[Gemini] {model} attempt {attempt}/2")
-                    resp   = _get_gemini_sync().models.generate_content(
-                        model=model, contents=prompt, config=self._make_config(),
-                    )
-                    result = (resp.text.strip(), model)
-                    self._cache.put(cache_key, result)
-                    log.info(f"[Gemini] ✅ Success — {model}")
-                    return result
-                except Exception as exc:
-                    log.error(f"[Gemini] {model} attempt {attempt} failed")
-                    log.error(traceback.format_exc())
-                    if attempt < 2:
-                        time.sleep(2 ** (attempt - 1))  # 1s, then 2s
+            try:
+                log.info(f"[Gemini] Trying model: {model}")
+                resp = _get_gemini_sync().models.generate_content(
+                    model=model, contents=prompt, config=self._make_config(),
+                )
+                result = (resp.text.strip(), model)
+                self._cache.put(cache_key, result)
+                log.info(f"[Gemini] ✅ Success — {model}")
+                return result
+            except Exception as exc:
+                error_str = str(exc).lower()
+                # Check for quota/resource errors - treat as hard failure
+                is_quota_error = any(kw in error_str for kw in [
+                    "resource_exhausted", "429", "quota", "rate limit"
+                ])
+                
+                log.error(f"[Gemini] ❌ {model} failed: {exc}")
+                log.error(traceback.format_exc())
+                
+                if is_quota_error:
+                    log.warning(f"[Gemini] Quota error detected, skipping {model}")
+                else:
+                    log.warning(f"[Gemini] Moving to next model")
+                
+                # Immediately move to next model - no retries per model
+                continue
 
         log.error("[Gemini] ❌ All models exhausted — returning safe fallback")
-        # Never return "حدث خطأ مؤقت" — return a safe medical fallback
+        # Safe medical fallback response
         safe = (
             "بناءً على الأعراض المذكورة، قد تكون الحالة ناتجة عن عدة أسباب محتملة. "
             "يلزم فحص طبي دقيق. أنصح بمراجعة طبيب متخصص للتقييم المناسب. 🏥"
@@ -1097,7 +1252,7 @@ state = AppState()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _request_semaphore
-    log.info("🚀 SILA v16.0 starting…")
+    log.info("🚀 SILA v17.1 starting…")
     _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     state.knowledge_base = KnowledgeBaseService()
     state.gemini         = GeminiService()
@@ -1115,9 +1270,9 @@ async def lifespan(app: FastAPI):
 # FastAPI App
 # ──────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Sila — Medical AI Assistant v16.0",
-    description="Hybrid RAG · Exact-Match Boost · Arabic & English",
-    version="16.0.0",
+    title="Sila — Medical AI Assistant v17.1",
+    description="RAG-First Hybrid · Deterministic Fallback · Arabic & English",
+    version="17.1.0",
     lifespan=lifespan,
 )
 
@@ -1130,17 +1285,18 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 @app.get("/")
 def root():
-    return {"name":"Sila — Medical AI","version":"16.0.0","status":"running ✅",
+    return {"name":"Sila — Medical AI","version":"17.1.0","status":"running ✅",
             "endpoints":["/ask","/analyze-image","/health","/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status":"ok","version":"16.0.0","config":{
+    return {"status":"ok","version":"17.1.0","config":{
         "embed_model":EMBED_MODEL,"embed_dim":EMBED_DIM,"index":INDEX_NAME,
         "min_confidence":MIN_CONFIDENCE,"top_k":TOP_K,"max_context_matches":MAX_CONTEXT_MATCHES,
         "hybrid_weights":f"cosine={WEIGHT_COSINE} exact={WEIGHT_EXACT} category={WEIGHT_CATEGORY}",
         "exact_match_threshold":EXACT_MATCH_THRESHOLD,
         "garbage_protection":"enabled","emergency_detection":"enabled",
+        "rag_first":"enabled","deterministic_fallback":"enabled",
     }}
 
 @app.get("/gemini-test")
@@ -1208,7 +1364,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     is_emg = EmergencyDetector.is_emergency(q, lang)
     if is_emg: log.warning("[ASK] 🚨 EMERGENCY")
 
-    # Retrieve
+    # RAG-FIRST: Retrieve from knowledge base
     try:
         raw_matches = await state.knowledge_base.search(q, top_k=TOP_K)
     except Exception as exc:
@@ -1223,7 +1379,7 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     cat_cons   = KnowledgeBaseService._category_consistency(selected)
     rel_ok     = KnowledgeBaseService._relevance_ok(q, selected)
 
-    # 4-mode decision
+    # HYBRID DECISION ENGINE (RAG-FIRST)
     if is_emg:
         rag_mode = "EMERGENCY_OVERRIDE"; reason = "emergency"
     elif not selected or top_score < MIN_CONFIDENCE:
@@ -1233,9 +1389,9 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     elif garbage_r > 0.5:
         rag_mode = "GEMINI_ONLY"; reason = f"garbage_ratio={garbage_r:.2f}"
     elif top_score >= 0.80 and cat_cons >= 0.7:
-        rag_mode = "RAG_STRONG"; reason = f"high_conf={top_score:.3f}"
+        rag_mode = "RAG_STRONG"; reason = f"high_conf={top_score:.3f} (RAG-ONLY)"
     elif top_score >= MIN_CONFIDENCE:
-        rag_mode = "RAG_LIGHT"; reason = f"medium_conf={top_score:.3f}"
+        rag_mode = "RAG_LIGHT"; reason = f"medium_conf={top_score:.3f} (RAG+Gemini)"
     else:
         rag_mode = "GEMINI_ONLY"; reason = "fallback"
 
@@ -1246,35 +1402,79 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
                                  confidence=m.confidence, category=m.category)
                      for m in selected]
 
-    # Execute mode
+    # Execute mode with fallback chain
     async def _gen(prompt):
-        return await state.gemini.generate(prompt)
+        try:
+            return await state.gemini.generate(prompt)
+        except Exception as exc:
+            log.error(f"[ASK] Gemini generation failed: {exc}")
+            raise
 
     if rag_mode == "EMERGENCY_OVERRIDE":
-        reply, model = await _gen(state.prompt_builder.build_emergency(q, lang))
-        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
-                           is_medical=True, found_in_database=False, low_confidence=False,
-                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        try:
+            reply, model = await _gen(state.prompt_builder.build_emergency(q, lang))
+            return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                               is_medical=True, found_in_database=False, low_confidence=False,
+                               language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        except Exception:
+            # Fallback to deterministic response
+            reply = _generate_deterministic_fallback(q, lang)
+            return AskResponse(query=q, reply=reply, model_used="fallback", matches=match_results,
+                               is_medical=True, found_in_database=False, low_confidence=True,
+                               language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
     if rag_mode == "RAG_STRONG":
-        ctx = QueryContext(raw_query=q, language=lang, matches=selected)
-        reply, model = await _gen(state.prompt_builder.build(ctx))
-        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
-                           is_medical=True, found_in_database=True, low_confidence=False,
-                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        # RAG-FIRST: High confidence - use RAG WITHOUT Gemini
+        # Directly use top match from knowledge base
+        if selected:
+            top_match = selected[0]
+            reply = f"{top_match.answer}\n\n(المصدر: قاعدة المعرفة الطبية)" if lang == "ar" else f"{top_match.answer}\n\n(Source: Medical Knowledge Base)"
+            log.info(f"[ASK] ✅ RAG-ONLY response (no Gemini)")
+            return AskResponse(query=q, reply=reply, model_used="rag-only", matches=match_results,
+                               is_medical=True, found_in_database=True, low_confidence=False,
+                               language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        else:
+            # Fallback to Gemini
+            try:
+                ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+                reply, model = await _gen(state.prompt_builder.build(ctx))
+                return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                                   is_medical=True, found_in_database=True, low_confidence=False,
+                                   language=lang, disclaimer=MEDICAL_DISCLAIMER)
+            except Exception:
+                reply = _generate_deterministic_fallback(q, lang)
+                return AskResponse(query=q, reply=reply, model_used="fallback", matches=match_results,
+                                   is_medical=True, found_in_database=False, low_confidence=True,
+                                   language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
     if rag_mode == "RAG_LIGHT":
-        ctx = QueryContext(raw_query=q, language=lang, matches=selected)
-        reply, model = await _gen(state.prompt_builder.build_rag_light(ctx))
-        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
-                           is_medical=True, found_in_database=True, low_confidence=True,
-                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        # RAG + Gemini: Medium confidence - use Gemini to enhance
+        try:
+            ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+            reply, model = await _gen(state.prompt_builder.build_rag_light(ctx))
+            return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                               is_medical=True, found_in_database=True, low_confidence=True,
+                               language=lang, disclaimer=MEDICAL_DISCLAIMER)
+        except Exception:
+            # Fallback to deterministic response
+            reply = _generate_deterministic_fallback(q, lang)
+            return AskResponse(query=q, reply=reply, model_used="fallback", matches=match_results,
+                               is_medical=True, found_in_database=False, low_confidence=True,
+                               language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
-    # GEMINI_ONLY
-    reply, model = await _gen(state.prompt_builder.build_gemini_only(q, lang))
-    return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
-                       is_medical=True, found_in_database=False, low_confidence=True,
-                       language=lang, disclaimer=MEDICAL_DISCLAIMER)
+    # GEMINI_ONLY: RAG failed or empty
+    try:
+        reply, model = await _gen(state.prompt_builder.build_gemini_only(q, lang))
+        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                           is_medical=True, found_in_database=False, low_confidence=True,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
+    except Exception:
+        # FINAL FALLBACK: Deterministic response (NO AI)
+        log.warning(f"[ASK] Both RAG and Gemini failed - using deterministic fallback")
+        reply = _generate_deterministic_fallback(q, lang)
+        return AskResponse(query=q, reply=reply, model_used="deterministic-fallback", matches=match_results,
+                           is_medical=True, found_in_database=False, low_confidence=True,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
 
 @app.post("/analyze-image", response_model=ImageAnalysisResponse)
@@ -1321,5 +1521,5 @@ async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
 
 if __name__ == "__main__":
     import uvicorn
-    log.info("🚀 Starting SILA v16.0…")
+    log.info("🚀 Starting SILA v17.1…")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=True)
