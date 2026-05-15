@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="Free Answers Model" />
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="After Sleep Try">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -52,7 +55,7 @@
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
-  <component name="RunManager" selected="Python.main">
+  <component name="RunManager" selected="Python.seed_pinecone">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="MedicalAssistant.AI" />
       <option name="ENV_FILES" value="" />
@@ -134,6 +137,7 @@
       <workItem from="1778797645565" duration="1906000" />
       <workItem from="1778800729153" duration="3052000" />
       <workItem from="1778808794577" duration="7777000" />
+      <workItem from="1778818998583" duration="2514000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -479,7 +483,15 @@
       <option name="project" value="LOCAL" />
       <updated>1778818709837</updated>
     </task>
-    <option name="localTasksCounter" value="44" />
+    <task id="LOCAL-00044" summary="After Sleep Try">
+      <option name="closed" value="true" />
+      <created>1778819105331</created>
+      <option name="number" value="00044" />
+      <option name="presentableId" value="LOCAL-00044" />
+      <option name="project" value="LOCAL" />
+      <updated>1778819105332</updated>
+    </task>
+    <option name="localTasksCounter" value="45" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -500,7 +512,6 @@
     <ignored-roots>
       <path value="$PROJECT_DIR$/.." />
     </ignored-roots>
-    <MESSAGE value="&#10;Make the Chat More Social" />
     <MESSAGE value="New Better Code Version" />
     <MESSAGE value="Fix Railway Naming" />
     <MESSAGE value="Solve Question and Text Conflict" />
@@ -525,11 +536,12 @@
     <MESSAGE value="Stronger Model" />
     <MESSAGE value="Stronger More Free Answers Model" />
     <MESSAGE value="Free Answers Model" />
-    <option name="LAST_COMMIT_MESSAGE" value="Free Answers Model" />
+    <MESSAGE value="After Sleep Try" />
+    <option name="LAST_COMMIT_MESSAGE" value="After Sleep Try" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/MedicalAssistant_AI$main.coverage" NAME="main Coverage Results" MODIFIED="1778603392948" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778817419553" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/main_py$seed_pinecone.coverage" NAME="seed_pinecone Coverage Results" MODIFIED="1778811027578" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1778859566665" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/main_py$seed_pinecone.coverage" NAME="seed_pinecone Coverage Results" MODIFIED="1778859571218" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
