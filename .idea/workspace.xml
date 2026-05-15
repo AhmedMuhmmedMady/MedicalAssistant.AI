@@ -1,11 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="Stronger More Free Answers Model">
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-    </list>
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="Free Answers Model" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -137,7 +133,7 @@
       <workItem from="1778683649987" duration="57522000" />
       <workItem from="1778797645565" duration="1906000" />
       <workItem from="1778800729153" duration="3052000" />
-      <workItem from="1778808794577" duration="7395000" />
+      <workItem from="1778808794577" duration="7777000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -467,7 +463,23 @@
       <option name="project" value="LOCAL" />
       <updated>1778804061449</updated>
     </task>
-    <option name="localTasksCounter" value="42" />
+    <task id="LOCAL-00042" summary="Stronger More Free Answers Model">
+      <option name="closed" value="true" />
+      <created>1778818440139</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1778818440139</updated>
+    </task>
+    <task id="LOCAL-00043" summary="Free Answers Model">
+      <option name="closed" value="true" />
+      <created>1778818709837</created>
+      <option name="number" value="00043" />
+      <option name="presentableId" value="LOCAL-00043" />
+      <option name="project" value="LOCAL" />
+      <updated>1778818709837</updated>
+    </task>
+    <option name="localTasksCounter" value="44" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -488,7 +500,6 @@
     <ignored-roots>
       <path value="$PROJECT_DIR$/.." />
     </ignored-roots>
-    <MESSAGE value="&#10;Make the Response Support Arabic" />
     <MESSAGE value="&#10;Make the Chat More Social" />
     <MESSAGE value="New Better Code Version" />
     <MESSAGE value="Fix Railway Naming" />
@@ -513,7 +524,8 @@
     <MESSAGE value="Fix Rag Model" />
     <MESSAGE value="Stronger Model" />
     <MESSAGE value="Stronger More Free Answers Model" />
-    <option name="LAST_COMMIT_MESSAGE" value="Stronger More Free Answers Model" />
+    <MESSAGE value="Free Answers Model" />
+    <option name="LAST_COMMIT_MESSAGE" value="Free Answers Model" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/MedicalAssistant_AI$main.coverage" NAME="main Coverage Results" MODIFIED="1778603392948" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
