@@ -760,7 +760,7 @@ def _generate_deterministic_fallback(query: str, language: str) -> str:
     red_flags = []
     emergency_kws = EMERGENCY_KEYWORDS_AR if language == "ar" else EMERGENCY_KEYWORDS_EN
     for kw in emergency_kws:
-        if kw.lower() in q.lower():
+        if kw.lower() in query.lower():
             red_flags.append(kw)
     
     # 3. Determine specialty from symptoms
