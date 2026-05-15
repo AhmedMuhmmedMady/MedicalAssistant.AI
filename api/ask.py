@@ -154,17 +154,9 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
             return _build_resp(reply, model, False, False)
 
         elif rag_mode == "RAG_STRONG":
-            if selected:
-                top_match = selected[0]
-                source_txt = "\n\n(المصدر: قاعدة المعرفة الطبية)" if lang == "ar" else "\n\n(Source: Medical Knowledge Base)"
-                reply = f"{top_match.answer}{source_txt}"
-                model = "rag-only"
-                log.info(f"[Model] ✅ RAG-ONLY response - confidence={top_score:.4f}")
-                return _build_resp(reply, model, True, False)
-            else:
-                ctx = QueryContext(raw_query=q, language=lang, matches=selected)
-                res = await model_router.generate({"prompt": prompt_builder.build(ctx), "query": q, "language": lang})
-                return _build_resp(res["response"], res["model_used"], True, False)
+            ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+            res = await model_router.generate({"prompt": prompt_builder.build(ctx), "query": q, "language": lang})
+            return _build_resp(res["response"], res["model_used"], True, False)
 
         elif rag_mode == "RAG_LIGHT":
             ctx = QueryContext(raw_query=q, language=lang, matches=selected)

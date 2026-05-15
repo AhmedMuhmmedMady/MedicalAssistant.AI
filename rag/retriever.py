@@ -27,6 +27,9 @@ async def get_index():
 _st_model: Any = None
 _st_lock        = threading.Lock()
 
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)
 def _load_and_encode_sync(text: str) -> List[float]:
     global _st_model
     if _st_model is None:

@@ -41,13 +41,8 @@ class KnowledgeBaseService:
     @staticmethod
     def _select_top_matches(matches: List[KnowledgeMatch], max_count: int = MAX_CONTEXT_MATCHES) -> List[KnowledgeMatch]:
         if not matches: return []
-        sorted_m, seen_cats, selected = sorted(matches, key=lambda m: m.confidence, reverse=True), set(), []
-        for m in sorted_m:
-            if len(selected) >= max_count: break
-            if m.category not in seen_cats or len(selected) < 2:
-                selected.append(m)
-                if m.category: seen_cats.add(m.category)
-        return selected
+        sorted_m = sorted(matches, key=lambda m: m.confidence, reverse=True)
+        return sorted_m[:max_count]
 
     @staticmethod
     def _calculate_garbage_ratio(matches: List[KnowledgeMatch]) -> float:
@@ -73,7 +68,14 @@ class KnowledgeBaseService:
                 out.add(tok)
         return out
 
+    _search_cache = {}
+
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
+        cache_key = f"{query}_{top_k}"
+        if cache_key in self._search_cache:
+            log.info(f"[KB-v2] Cache hit for '{query[:30]}'")
+            return self._search_cache[cache_key]
+
         log.info(f"[KB-v2] Searching: '{query[:80]}'")
         expected_cats = _extract_expected_categories(query)
         log.info(f"[KB-v2] Expected categories: {expected_cats or ['unknown']}")
@@ -99,7 +101,9 @@ class KnowledgeBaseService:
                 raw_scores = [round(float(m.score), 4) for m in results.matches if m.score]
                 log.info(f"[KB-v2] Pinecone raw scores ({len(raw_scores)}): {raw_scores}")
 
-                return self._parse_matches_hybrid(results, query, expected_cats, top_k)
+                res = self._parse_matches_hybrid(results, query, expected_cats, top_k)
+                self._search_cache[cache_key] = res
+                return res
 
             except Exception as exc:
                 log.warning(f"[KB-v2] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
@@ -127,7 +131,8 @@ class KnowledgeBaseService:
             a_text   = meta.get("answer",   "")
             category = meta.get("category", "General")
 
-            final, exact_b, cat_b, match_type = compute_hybrid_score(
+            from rag.scoring import compute_hybrid_score
+            final, semantic, cat_b, match_type = compute_hybrid_score(
                 cosine=cosine, query_norm=query_norm, match_question=q_text,
                 match_category=category, expected_categories=expected_cats,
             )
@@ -135,7 +140,7 @@ class KnowledgeBaseService:
             icon = "🎯" if match_type == "exact" else "🔍" if match_type == "high_similarity" else "🌐"
             log.info(
                 f"[KB-v2] {icon} {match_type:<16} cosine={cosine:.3f} "
-                f"exact_b={exact_b:.2f} cat_b={cat_b:.2f} → final={final:.4f} "
+                f"semantic={semantic:.2f} cat_b={cat_b:.2f} → final={final:.4f} "
                 f"| cat={category} | q='{q_text[:50]}'"
             )
 
