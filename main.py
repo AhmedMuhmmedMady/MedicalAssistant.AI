@@ -1,19 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          SILA — Medical AI Assistant  v14.2                     ║
+║          SILA — Medical AI Assistant  v15.0                     ║
 ║          Railway-Hardened · 384-dim · Local Embeddings Only     ║
 ║                                                                  ║
 ║  Stack : FastAPI + Pinecone v3 + Gemini (google-genai SDK)      ║
-║  Mode  : Strict RAG (local 384-dim) · Social chat               ║
+║  Mode  : 4-Tier Hybrid RAG · Garbage-Filtered · Emergency-Aware ║
 ║                                                                  ║
-║  🎯 v14.2 Changes:                                              ║
-║  • MIN_CONFIDENCE: 0.45 → 0.60                                  ║
-║  • RAG_STRONG gap: +0.10 → +0.15 (score >= 0.75)                ║
-║  • ✅ Added keyword-overlap relevance guard                     ║
-║  • ✅ RAG_WEAK requires relevance_ok                            ║
-║  • ✅ GEMINI_ONLY gives real medical answers                    ║
-║  • ✅ Better category consistency tracking                      ║
-║  • ✅ Improved error handling & logging                         ║
+║  🎯 v15.0 Hardening:                                             ║
+║  • 4-mode decision: RAG_STRONG, RAG_LIGHT, GEMINI_ONLY, EMERGENCY║
+║  • Hard garbage filtering (ultra-short, junk patterns)         ║
+║  • Match sanitization (deduplicate, normalize Arabic, trim)     ║
+║  • Context limit: MAX_CONTEXT_MATCHES = 3                       ║
+║  • Gemini retry with exponential backoff                         ║
+║  • Safe medical fallback (never "حدث خطأ مؤقت")                 ║
+║  • Enhanced relevance guard (medical token extraction)          ║
+║  • Garbage ratio protection (>50% → GEMINI_ONLY)                 ║
+║  • Emergency detection with immediate ER guidance               ║
+║  • Full observability (latency, rag_mode, garbage_ratio)        ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -308,10 +311,62 @@ LOW_QUALITY_PATTERNS: frozenset = frozenset({
     "تم الاجابة",
     "كل شيء ممكن",
     "راجع الطبيب",
+    "استشر طبيب",
+    "غير واضح",
+    "وضح اكثر",
     "natural",
     "answered",
     "everything possible",
     "consult doctor",
+    "not clear",
+    "clarify more",
+})
+
+# Extended garbage patterns for hard filtering
+GARBAGE_PATTERNS: frozenset = frozenset({
+    # Arabic
+    "تم الاجابة",
+    "راجع الطبيب",
+    "استشر طبيب",
+    "كل شيء ممكن",
+    "غير واضح",
+    "وضح اكثر",
+    "طبيعي",
+    "لا يوجد",
+    "لا يوجد جواب",
+    "لا يوجد رد",
+    "معلومات غير متوفرة",
+    "غير متوفر",
+    "لا اعرف",
+    "لا أستطيع",
+    "لا يمكنني",
+    "معلومات محدودة",
+    # English
+    "answered",
+    "consult doctor",
+    "everything possible",
+    "not clear",
+    "clarify more",
+    "natural",
+    "no answer",
+    "no response",
+    "information not available",
+    "not available",
+    "don't know",
+    "cannot",
+    "limited information",
+})
+
+# Context size limit
+MAX_CONTEXT_MATCHES = 3
+
+# Arabic normalization map
+ARABIC_NORMALIZATION = str.maketrans({
+    'أ': 'ا', 'إ': 'ا', 'آ': 'ا',
+    'ة': 'ه',
+    'ى': 'ي',
+    'ؤ': 'و',
+    'ئ': 'ي',
 })
 
 # Emergency keywords (require immediate ER attention)
@@ -355,6 +410,23 @@ class KnowledgeMatch:
         """Check if answer contains low-quality patterns."""
         answer_lower = self.answer.lower()
         return any(pattern.lower() in answer_lower for pattern in LOW_QUALITY_PATTERNS)
+
+    @property
+    def is_garbage(self) -> bool:
+        """Hard garbage check - rejects ultra-short or garbage answers."""
+        answer = self.answer.strip()
+        
+        # Reject ultra-short answers
+        if len(answer) < 12:
+            return True
+        
+        # Reject garbage patterns
+        answer_lower = answer.lower()
+        for pattern in GARBAGE_PATTERNS:
+            if pattern.lower() in answer_lower:
+                return True
+        
+        return False
 
 
 @dataclass
@@ -533,6 +605,111 @@ class KnowledgeBaseService:
     """RAG pipeline: embedding, Pinecone search, relevance filtering."""
 
     @staticmethod
+    def _normalize_arabic(text: str) -> str:
+        """Normalize Arabic text (أ->ا, ة->ه, etc.)."""
+        # Remove diacritics
+        clean = re.sub(r"[\u064b-\u065f\u0670]", "", text.lower())
+        # Normalize letters
+        clean = clean.translate(ARABIC_NORMALIZATION)
+        return clean
+
+    @staticmethod
+    def _sanitize_match(match: KnowledgeMatch) -> KnowledgeMatch:
+        """Sanitize a single match: trim, normalize Arabic, clean whitespace."""
+        question = match.question.strip()
+        answer = match.answer.strip()
+        
+        # Normalize Arabic
+        if any('\u0600' <= c <= '\u06ff' for c in question):
+            question = KnowledgeBaseService._normalize_arabic(question)
+        if any('\u0600' <= c <= '\u06ff' for c in answer):
+            answer = KnowledgeBaseService._normalize_arabic(answer)
+        
+        # Clean whitespace
+        question = re.sub(r'\s+', ' ', question)
+        answer = re.sub(r'\s+', ' ', answer)
+        
+        return KnowledgeMatch(
+            question=question,
+            answer=answer,
+            confidence=match.confidence,
+            category=match.category,
+        )
+
+    @staticmethod
+    def _deduplicate_and_sanitize(matches: List[KnowledgeMatch]) -> List[KnowledgeMatch]:
+        """
+        Deduplicate matches, sanitize, and remove garbage.
+        
+        Returns:
+            Sanitized matches with:
+            - No duplicate answers
+            - No garbage matches
+            - Trimmed and normalized text
+        """
+        seen_answers = set()
+        sanitized = []
+        
+        for match in matches:
+            # Skip garbage matches
+            if match.is_garbage:
+                continue
+            
+            # Deduplicate by answer content
+            answer_key = match.answer.lower().strip()
+            if answer_key in seen_answers:
+                continue
+            seen_answers.add(answer_key)
+            
+            # Sanitize
+            sanitized_match = KnowledgeBaseService._sanitize_match(match)
+            sanitized.append(sanitized_match)
+        
+        return sanitized
+
+    @staticmethod
+    def _select_top_matches(
+        matches: List[KnowledgeMatch],
+        max_count: int = MAX_CONTEXT_MATCHES,
+    ) -> List[KnowledgeMatch]:
+        """
+        Select top matches with diverse categories.
+        
+        Strategy:
+        1. Sort by confidence (highest first)
+        2. Pick top N with category diversity
+        """
+        if not matches:
+            return []
+        
+        # Sort by confidence
+        sorted_matches = sorted(matches, key=lambda m: m.confidence, reverse=True)
+        
+        # Select with category diversity
+        selected = []
+        seen_categories = set()
+        
+        for match in sorted_matches:
+            if len(selected) >= max_count:
+                break
+            
+            # Always include if we have room and haven't seen this category
+            if match.category not in seen_categories or len(selected) < 2:
+                selected.append(match)
+                if match.category:
+                    seen_categories.add(match.category)
+        
+        return selected
+
+    @staticmethod
+    def _calculate_garbage_ratio(matches: List[KnowledgeMatch]) -> float:
+        """Calculate ratio of garbage matches."""
+        if not matches:
+            return 0.0
+        garbage_count = sum(1 for m in matches if m.is_garbage)
+        return round(garbage_count / len(matches), 2)
+
+    @staticmethod
     def _category_consistency(matches: List[KnowledgeMatch]) -> float:
         """Calculate category consistency score (0.0-1.0)."""
         if not matches:
@@ -552,16 +729,9 @@ class KnowledgeBaseService:
         Normalizes Arabic letters, removes diacritics, filters stop words,
         and keeps only medically relevant tokens (>= 3 chars).
         """
-        # Normalize Arabic letters (أ -> ا, ة -> ه)
-        arabic_normalization = str.maketrans({
-            'أ': 'ا', 'إ': 'ا', 'آ': 'ا',
-            'ة': 'ه',
-            'ى': 'ي',
-        })
-        
-        # Remove diacritics and normalize
+        # Remove diacritics and normalize using the global map
         clean = re.sub(r"[\u064b-\u065f\u0670]", "", text.lower())
-        clean = clean.translate(arabic_normalization)
+        clean = clean.translate(ARABIC_NORMALIZATION)
         
         # Tokenize
         tokens = set(t for t in re.split(r"[\s\W]+", clean) if len(t) >= 3)
@@ -662,47 +832,6 @@ class KnowledgeBaseService:
         return []
 
     @staticmethod
-    def _relevance_ok(query: str, matches: List[KnowledgeMatch], min_overlap: int = 1) -> bool:
-        """
-        Relevance Guard: Keyword overlap check to prevent Pinecone cosine drift.
-        
-        Checks that at least `min_overlap` query tokens appear in top-3 match texts.
-        
-        Why? Pinecone similarity can give high scores for off-topic results
-        (e.g., "heart disease" when searching for "headache pain").
-        """
-        if not matches:
-            return False
-
-        # Normalize and tokenize query
-        q_clean = re.sub(r"[\u064b-\u065f]", "", query.lower())  # Remove Arabic diacritics
-        q_tokens = set(t for t in re.split(r"[\s\W]+", q_clean) if len(t) >= 3)
-
-        if not q_tokens:
-            # Can't check empty token set — allow through
-            log.info("[KB] Relevance: Query too short/empty — allowing")
-            return True
-
-        # Build token set from top-3 match texts
-        combined = " ".join(
-            f"{m.question} {m.answer}" for m in matches[:3]
-        ).lower()
-        combined_clean = re.sub(r"[\u064b-\u065f]", "", combined)
-        match_tokens = set(t for t in re.split(r"[\s\W]+", combined_clean) if len(t) >= 3)
-
-        # Check overlap
-        overlap = len(q_tokens & match_tokens)
-        ok = overlap >= min_overlap
-
-        log.info(
-            f"[KB] Relevance guard: query_tokens={len(q_tokens)} "
-            f"match_tokens={len(match_tokens)} overlap={overlap} min_overlap={min_overlap} "
-            f"result={'✅' if ok else '❌'}"
-        )
-
-        return ok
-
-    @staticmethod
     def _parse_matches(results: Any) -> List[KnowledgeMatch]:
         """Parse Pinecone results into KnowledgeMatch objects."""
         matches = []
@@ -791,6 +920,60 @@ class PromptBuilder:
         "5. Do NOT repeatedly say 'my knowledge is limited' — provide genuine medical value."
     )
 
+    _RAG_LIGHT_AR = (
+        "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
+        "أسلوبك: دافئ واحترافي، كأنك طبيب خبير يشرح لمريضه بصدق واهتمام.\n\n"
+        "⚠️ ملاحظة هامة: المعلومات المسترجعة أدناه محدودة وقد لا تكون كافية.\n"
+        "استخدمها كإشارات داعمة فقط، واعتمد بشكل أساسي على معرفتك الطبية العامة.\n\n"
+        "قواعد صارمة:\n"
+        "١. استخدم المعلومات المقدمة كإشارات داعمة، لكن لا تُعتمد عليها بالكامل.\n"
+        "٢. استخدم معرفتك الطبية العامة لتقديم إجابة شاملة ومفيدة.\n"
+        "٣. لا تُقدم تشخيصاً نهائياً أبداً — قدّم احتمالات وأسباباً محتملة.\n"
+        "٤. اذكر علامات الخطر التي تستدعي التدخل العاجل إن وُجدت.\n"
+        "٥. اختم دائماً بالتوصية بمراجعة طبيب متخصص.\n"
+        "٦. لغة الإجابة: عربية واضحة ومفهومة."
+    )
+
+    _RAG_LIGHT_EN = (
+        "You are 'Sila', a trusted and empathetic medical AI assistant.\n"
+        "Tone: warm, calm, and professionally precise.\n\n"
+        "⚠️ Important Note: The retrieved information below is limited and may be insufficient.\n"
+        "Use it only as supporting hints, and rely primarily on your general medical knowledge.\n\n"
+        "Strict rules:\n"
+        "1. Use the provided information as supporting hints only, do not rely on it completely.\n"
+        "2. Use your general medical knowledge to provide a comprehensive and helpful answer.\n"
+        "3. NEVER provide a definitive diagnosis — suggest possibilities and likely causes.\n"
+        "4. Flag any warning signs that require urgent care.\n"
+        "5. Always close by recommending a specialist consultation.\n"
+        "6. Respond in clear, professional English."
+    )
+
+    _EMERGENCY_AR = (
+        "أنت 'سيلا'، مساعد طبي ذكي وموثوق.\n"
+        "أسلوبك: هادئ وحازم، تركز على سلامة المريض أولاً.\n\n"
+        "🚨 تنبيه هام: يبدو أن المريض يعاني من أعراض طارئة قد تستدعي رعاية عاجلة.\n\n"
+        "قواعد صارمة:\n"
+        "١. قدّم إجابة فورية ومباشرة حول الأعراض الطارئة.\n"
+        "٢. أوصي بشدة بمراجعة قسم الطوارئ أو الاتصال بالإسعاف فوراً.\n"
+        "٣. اذكر علامات الخطر التي تستدعي التدخل العاجل.\n"
+        "٤. لا تُقدم تشخيصاً نهائياً — قدّم تقييماً أولياً فقط.\n"
+        "٥. لغة الإجابة: عربية واضحة ومفهومة.\n"
+        "٦. كن مختصراً ومباشراً — السلامة أولاً."
+    )
+
+    _EMERGENCY_EN = (
+        "You are 'Sila', a trusted and empathetic medical AI assistant.\n"
+        "Tone: calm and firm, prioritizing patient safety above all.\n\n"
+        "🚨 Important Alert: The patient appears to be experiencing emergency symptoms that may require urgent care.\n\n"
+        "Strict rules:\n"
+        "1. Provide immediate and direct guidance on emergency symptoms.\n"
+        "2. Strongly recommend visiting the emergency department or calling an ambulance immediately.\n"
+        "3. List warning signs that require urgent intervention.\n"
+        "4. NEVER provide a definitive diagnosis — provide initial assessment only.\n"
+        "5. Respond in clear, professional English.\n"
+        "6. Be concise and direct — safety first."
+    )
+
     _STRUCTURE_AR = (
         "رتّب إجابتك بهذا الشكل:\n\n"
         "🔍 الأسباب المحتملة:\n"
@@ -826,6 +1009,24 @@ class PromptBuilder:
         "I strongly recommend consulting a specialist for a proper and safe evaluation. "
         "Your health deserves accurate, professional care. 🏥"
     )
+
+    # Safe fallback medical responses (when everything fails)
+    _FALLBACK_AR = (
+        "بناءً على الأعراض المذكورة، قد تكون الحالة ناتجة عن عدة أسباب محتملة مثل التهاب، "
+        "إصابة بسيطة، أو تغيرات فسيولوجية طبيعية. ومع ذلك، يلزم فحص طبي دقيق لتحديد السبب بدقة "
+        "واستبعاد أي حالات أكثر خطورة. أنصح بشدة بمراجعة طبيب متخصص للتقييم المناسب. 🏥"
+    )
+
+    _FALLBACK_EN = (
+        "Based on the symptoms mentioned, this could be caused by several possible factors such as "
+        "inflammation, minor injury, or normal physiological changes. However, a proper medical examination "
+        "is needed to accurately determine the cause and rule out any more serious conditions. "
+        "I strongly recommend consulting a specialist for proper evaluation. 🏥"
+    )
+
+    def safe_fallback_response(self, language: str) -> str:
+        """Return a safe, medically useful fallback response."""
+        return self._FALLBACK_AR if language == "ar" else self._FALLBACK_EN
 
     def _build_context_block(
         self,
@@ -898,6 +1099,43 @@ class PromptBuilder:
             f"{system}\n\n{weak_warning}\n\n{sep}\n"
             f"{label_context}\n\n{context_block}\n\n{sep}\n"
             f"{label_question}\n{ctx.raw_query}\n\n"
+            f"{structure}\n\n{label_answer}"
+        )
+
+    def build_rag_light(self, ctx: QueryContext) -> str:
+        """Build RAG_LIGHT prompt (light hints, rely on general knowledge)."""
+        lang      = ctx.language
+        system    = self._RAG_LIGHT_AR if lang == "ar" else self._RAG_LIGHT_EN
+        structure = self._STRUCTURE_AR  if lang == "ar" else self._STRUCTURE_EN
+        sep       = self._SEP
+
+        context_block  = self._build_context_block(ctx.matches, lang)
+        label_context  = (
+            "📋 قاعدة المعرفة الطبية (إشارات محدودة):"
+            if lang == "ar"
+            else "📋 Medical Knowledge Base (limited hints):"
+        )
+        label_question = "🧑‍⚕️ سؤال المريض:" if lang == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer   = "الإجابة:"            if lang == "ar" else "Answer:"
+
+        return (
+            f"{system}\n\n{sep}\n"
+            f"{label_context}\n\n{context_block}\n\n{sep}\n"
+            f"{label_question}\n{ctx.raw_query}\n\n"
+            f"{structure}\n\n{label_answer}"
+        )
+
+    def build_emergency(self, query: str, language: str) -> str:
+        """Build EMERGENCY_OVERRIDE prompt (urgent care guidance)."""
+        system         = self._EMERGENCY_AR if language == "ar" else self._EMERGENCY_EN
+        structure      = self._STRUCTURE_AR  if language == "ar" else self._STRUCTURE_EN
+        label_question = "🧑‍⚕️ سؤال المريض:"  if language == "ar" else "🧑‍⚕️ Patient Question:"
+        label_answer   = "الإجابة:"            if language == "ar" else "Answer:"
+        sep            = self._SEP
+
+        return (
+            f"{system}\n\n{sep}\n"
+            f"{label_question}\n{query}\n\n"
             f"{structure}\n\n{label_answer}"
         )
 
@@ -1019,7 +1257,7 @@ class GeminiService:
     # ── RAG Generation ─────────────────────────────────────────────
 
     def _generate_sync(self, prompt: str) -> Tuple[str, str]:
-        """Generate medical response with caching."""
+        """Generate medical response with caching and retry logic."""
         cache_key = hashlib.sha256(prompt.encode()).hexdigest()
         cached = self._cache.get(cache_key)
 
@@ -1027,19 +1265,26 @@ class GeminiService:
             log.info("[Gemini] ✅ Cache hit")
             return cached
 
-        for model_name in GEMINI_TEXT_MODELS:
-            try:
-                log.info(f"[Gemini] Generate — {model_name}")
-                resp = _get_gemini_sync().models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=self._make_config(),
-                )
-                result = (resp.text.strip(), model_name)
-                self._cache.put(cache_key, result)
-                return result
-            except Exception as exc:
-                log.warning(f"[Gemini] {model_name} failed: {exc}")
+        # Try each model with exponential backoff
+        for model_idx, model_name in enumerate(GEMINI_TEXT_MODELS):
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    log.info(f"[Gemini] Generate — {model_name} (attempt {attempt + 1}/{max_retries})")
+                    resp = _get_gemini_sync().models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=self._make_config(),
+                    )
+                    result = (resp.text.strip(), model_name)
+                    self._cache.put(cache_key, result)
+                    return result
+                except Exception as exc:
+                    log.warning(f"[Gemini] {model_name} failed (attempt {attempt + 1}): {exc}")
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 1s, 2s
+                        backoff = 2 ** attempt
+                        time.sleep(backoff)
 
         log.error("[Gemini] ❌ All text models exhausted")
         return (
@@ -1257,7 +1502,7 @@ def root():
     """Root endpoint — info."""
     return {
         "name": "Sila — Medical AI Assistant",
-        "version": "14.2.0",
+        "version": "15.0.0",
         "status": "running ✅",
         "endpoints": ["/ask", "/analyze-image", "/health", "/docs"],
         "docs": "https://sila-medical.docs.io",
@@ -1269,7 +1514,7 @@ def health():
     """Health check — ultra-fast, no SDK calls."""
     return {
         "status": "ok",
-        "version": "14.2.0",
+        "version": "15.0.0",
         "uptime": "healthy",
         "config": {
             "embed_model": EMBED_MODEL,
@@ -1277,7 +1522,11 @@ def health():
             "index": INDEX_NAME,
             "min_confidence": MIN_CONFIDENCE,
             "top_k": TOP_K,
-            "rag_strong_threshold": MIN_CONFIDENCE + 0.15,
+            "max_context_matches": MAX_CONTEXT_MATCHES,
+            "rag_strong_threshold": 0.80,
+            "rag_light_threshold": MIN_CONFIDENCE,
+            "garbage_protection": "enabled",
+            "emergency_detection": "enabled",
         }
     }
 
@@ -1335,7 +1584,8 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
-    """Inner logic for /ask endpoint."""
+    """Inner logic for /ask endpoint with 4-mode decision engine."""
+    start_time = time.time()
     q        = req.query
     language = LanguageDetector.detect(q)
     intent   = await IntentClassifier.classify(q)
@@ -1345,7 +1595,8 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
     # ── SOCIAL INTENT ─────────────────────────────────────────────
     if intent == "social":
         reply, model_used = await state.gemini.reply_social(q, language)
-        log.info(f"[ASK] ✅ Social response — {model_used}")
+        latency_ms = round((time.time() - start_time) * 1000)
+        log.info(f"[ASK] ✅ Social response — {model_used} | latency={latency_ms}ms")
         return AskResponse(
             query=q, reply=reply, model_used=model_used, matches=[],
             is_medical=False, found_in_database=False, low_confidence=False,
@@ -1359,36 +1610,42 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
     # ── MEDICAL INTENT: RETRIEVE FROM KB ──────────────────────────
     try:
-        matches = await state.knowledge_base.search(q, top_k=TOP_K)
+        raw_matches = await state.knowledge_base.search(q, top_k=TOP_K)
     except Exception as exc:
         log.error(f"[ASK] KB search failed: {exc}")
-        matches = []
+        raw_matches = []
 
-    # ── 3-TIER DECISION ENGINE ────────────────────────────────────
-    top_score            = matches[0].confidence if matches else 0.0
-    category_consistency = KnowledgeBaseService._category_consistency(matches)
-    relevance_ok         = KnowledgeBaseService._relevance_ok(q, matches)
+    # ── MATCH SANITIZATION ────────────────────────────────────────
+    sanitized_matches = KnowledgeBaseService._deduplicate_and_sanitize(raw_matches)
+    garbage_ratio = KnowledgeBaseService._calculate_garbage_ratio(raw_matches)
+    
+    # Select top matches with category diversity
+    selected_matches = KnowledgeBaseService._select_top_matches(sanitized_matches, MAX_CONTEXT_MATCHES)
 
-    # Check for low-quality matches (garbage KB responses)
-    low_quality_count = sum(1 for m in matches if m.is_low_quality)
-    low_quality_ratio = low_quality_count / len(matches) if matches else 0.0
+    # ── 4-MODE DECISION ENGINE ────────────────────────────────────
+    top_score            = selected_matches[0].confidence if selected_matches else 0.0
+    category_consistency = KnowledgeBaseService._category_consistency(selected_matches)
+    relevance_ok         = KnowledgeBaseService._relevance_ok(q, selected_matches)
 
     # Determine RAG mode
-    if not matches or top_score < MIN_CONFIDENCE:
+    if is_emergency:
+        rag_mode = "EMERGENCY_OVERRIDE"
+        reason   = "emergency_keywords_detected"
+    elif not selected_matches or top_score < MIN_CONFIDENCE:
         rag_mode = "GEMINI_ONLY"
         reason   = f"no_matches_or_low_score(score={top_score:.3f})"
     elif not relevance_ok:
         rag_mode = "GEMINI_ONLY"
         reason   = "relevance_guard_failed"
-    elif low_quality_ratio > 0.6:
-        # More than 60% low-quality matches → downgrade to GEMINI_ONLY
+    elif garbage_ratio > 0.5:
+        # More than 50% garbage → protect Gemini from bad context
         rag_mode = "GEMINI_ONLY"
-        reason   = f"low_quality_ratio={low_quality_ratio:.2f}>0.6"
-    elif top_score >= MIN_CONFIDENCE + 0.15 and category_consistency >= 0.7:
+        reason   = f"garbage_ratio={garbage_ratio:.2f}>0.5"
+    elif top_score >= 0.80 and category_consistency >= 0.7:
         rag_mode = "RAG_STRONG"
         reason   = f"high_confidence_{top_score:.3f}_consistent_categories"
     elif top_score >= MIN_CONFIDENCE:
-        rag_mode = "RAG_WEAK"
+        rag_mode = "RAG_LIGHT"
         reason   = f"medium_confidence_{top_score:.3f}"
     else:
         rag_mode = "GEMINI_ONLY"
@@ -1396,15 +1653,16 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
 
     # Get category distribution
     category_dist: Dict[str, int] = {}
-    if matches:
-        categories = [m.category for m in matches if m.category]
+    if selected_matches:
+        categories = [m.category for m in selected_matches if m.category]
         category_dist = dict(Counter(categories))
 
     log.info(
         f"[ASK] 🎯 {rag_mode} — {reason} "
-        f"| top_score={top_score:.4f} | matches={len(matches)} "
-        f"| relevance_ok={relevance_ok} | category_consistency={category_consistency:.2f} "
-        f"| low_quality_ratio={low_quality_ratio:.2f}"
+        f"| top_score={top_score:.4f} | raw_matches={len(raw_matches)} "
+        f"| sanitized={len(sanitized_matches)} | selected={len(selected_matches)} "
+        f"| garbage_ratio={garbage_ratio:.2f} | relevance_ok={relevance_ok} "
+        f"| category_consistency={category_consistency:.2f}"
     )
 
     # Convert to response format
@@ -1415,16 +1673,40 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             confidence=m.confidence,
             category=m.category,
         )
-        for m in matches
+        for m in selected_matches
     ]
+
+    # ── EMERGENCY_OVERRIDE ───────────────────────────────────────
+    if rag_mode == "EMERGENCY_OVERRIDE":
+        try:
+            prompt            = state.prompt_builder.build_emergency(q, language)
+            reply, model_used = await state.gemini.generate(prompt)
+            latency_ms = round((time.time() - start_time) * 1000)
+            log.info(f"[ASK] ✅ EMERGENCY_OVERRIDE — {model_used} | latency={latency_ms}ms")
+            return AskResponse(
+                query=q, reply=reply, model_used=model_used,
+                matches=match_results,
+                is_medical=True, found_in_database=False, low_confidence=False,
+                language=language, disclaimer=MEDICAL_DISCLAIMER,
+            )
+        except Exception as exc:
+            log.error(f"[ASK] EMERGENCY_OVERRIDE Gemini failed: {exc} — fallback to safe response")
+            reply = state.prompt_builder.safe_fallback_response(language)
+            return AskResponse(
+                query=q, reply=reply, model_used="fallback",
+                matches=match_results,
+                is_medical=True, found_in_database=False, low_confidence=True,
+                language=language, disclaimer=MEDICAL_DISCLAIMER,
+            )
 
     # ── RAG_STRONG ────────────────────────────────────────────────
     if rag_mode == "RAG_STRONG":
-        ctx = QueryContext(raw_query=q, language=language, matches=matches)
+        ctx = QueryContext(raw_query=q, language=language, matches=selected_matches)
         try:
             prompt            = state.prompt_builder.build(ctx)
             reply, model_used = await state.gemini.generate(prompt)
-            log.info(f"[ASK] ✅ RAG_STRONG — {model_used}")
+            latency_ms = round((time.time() - start_time) * 1000)
+            log.info(f"[ASK] ✅ RAG_STRONG — {model_used} | latency={latency_ms}ms")
             return AskResponse(
                 query=q, reply=reply, model_used=model_used,
                 matches=match_results,
@@ -1435,13 +1717,14 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             log.error(f"[ASK] RAG_STRONG Gemini failed: {exc} — fallback to GEMINI_ONLY")
             rag_mode = "GEMINI_ONLY"
 
-    # ── RAG_WEAK ──────────────────────────────────────────────────
-    if rag_mode == "RAG_WEAK":
-        ctx = QueryContext(raw_query=q, language=language, matches=matches)
+    # ── RAG_LIGHT ─────────────────────────────────────────────────
+    if rag_mode == "RAG_LIGHT":
+        ctx = QueryContext(raw_query=q, language=language, matches=selected_matches)
         try:
-            prompt            = state.prompt_builder.build_rag_weak(ctx)
+            prompt            = state.prompt_builder.build_rag_light(ctx)
             reply, model_used = await state.gemini.generate(prompt)
-            log.info(f"[ASK] ✅ RAG_WEAK — {model_used}")
+            latency_ms = round((time.time() - start_time) * 1000)
+            log.info(f"[ASK] ✅ RAG_LIGHT — {model_used} | latency={latency_ms}ms")
             return AskResponse(
                 query=q, reply=reply, model_used=model_used,
                 matches=match_results,
@@ -1449,14 +1732,15 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
                 language=language, disclaimer=MEDICAL_DISCLAIMER,
             )
         except Exception as exc:
-            log.error(f"[ASK] RAG_WEAK Gemini failed: {exc} — fallback to GEMINI_ONLY")
+            log.error(f"[ASK] RAG_LIGHT Gemini failed: {exc} — fallback to GEMINI_ONLY")
             rag_mode = "GEMINI_ONLY"
 
     # ── GEMINI_ONLY ───────────────────────────────────────────────
     try:
         prompt            = state.prompt_builder.build_gemini_only(q, language)
         reply, model_used = await state.gemini.generate(prompt)
-        log.info(f"[ASK] ✅ GEMINI_ONLY — {model_used}")
+        latency_ms = round((time.time() - start_time) * 1000)
+        log.info(f"[ASK] ✅ GEMINI_ONLY — {model_used} | latency={latency_ms}ms")
         return AskResponse(
             query=q, reply=reply, model_used=model_used,
             matches=match_results,
@@ -1464,10 +1748,10 @@ async def _ask_inner(req: AskRequest) -> AskResponse:
             language=language, disclaimer=MEDICAL_DISCLAIMER,
         )
     except Exception as exc:
-        log.error(f"[ASK] ❌ GEMINI_ONLY failed: {exc}")
-        reply = state.prompt_builder.no_data_response(language)
+        log.error(f"[ASK] ❌ GEMINI_ONLY failed: {exc} — using safe fallback")
+        reply = state.prompt_builder.safe_fallback_response(language)
         return AskResponse(
-            query=q, reply=reply, model_used="none",
+            query=q, reply=reply, model_used="fallback",
             matches=match_results,
             is_medical=True, found_in_database=False, low_confidence=True,
             language=language, disclaimer=MEDICAL_DISCLAIMER,
