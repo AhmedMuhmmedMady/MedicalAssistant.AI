@@ -2,7 +2,6 @@
 ╔══════════════════════════════════════════════════════════════════╗
 ║          SILA — Medical AI Assistant  v16.0                     ║
 ║          Hybrid RAG · Exact-Match Boost · Medical Awareness     ║
-║          Production-Grade: Safe, Scalable, Fast, Resilient      ║
 ║                                                                  ║
 ║  🆕 v16.0 Retrieval Upgrades:                                    ║
 ║  • Hybrid Scoring: cosine(0.6) + exact(0.3) + category(0.1)    ║
@@ -12,17 +11,6 @@
 ║  • Improved relevance guard (exact + category fast paths)       ║
 ║  • Rich logging: exact/similarity/semantic per result           ║
 ║  كل حاجة تانية من v15.0 محتفظ بيها بدون تغيير                  ║
-║                                                                  ║
-║  🆕 v16.0 Production Improvements:                               ║
-║  • SentenceTransformer init moved to FastAPI lifespan          ║
-║  • Thread-safe Pinecone initialization                          ║
-║  • Embedding caching (LRU with TTL)                             ║
-║  • Retry with exponential backoff for external calls             ║
-║  • Graceful fallback if embedding fails                         ║
-║  • Per-service timeout handling (embed/pinecone/gemini)         ║
-║  • Request ID logging for traceability                         ║
-║  • Reduced noisy logs (debug for details)                       ║
-║  • Safe rate limiting with lock                                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -33,9 +21,11 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import asyncio
+import base64
 import collections
 import functools
 import hashlib
+import json
 import logging
 import re
 import sys
@@ -49,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.setrecursionlimit(1000)
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
@@ -77,16 +67,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 EMBED_DIM   = 384
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
-
-# Split timeouts per service
-EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "10"))
-PINECONE_TIMEOUT   = int(os.getenv("PINECONE_TIMEOUT", "15"))
-GEMINI_TIMEOUT      = int(os.getenv("GEMINI_TIMEOUT", "30"))
-EXTERNAL_CALL_TIMEOUT   = int(os.getenv("EXTERNAL_CALL_TIMEOUT", "35"))
-
-# Cache settings
-EMBEDDING_CACHE_MAX_SIZE = int(os.getenv("EMBEDDING_CACHE_MAX_SIZE", "1000"))
-EMBEDDING_CACHE_TTL_SECONDS = int(os.getenv("EMBEDDING_CACHE_TTL_SECONDS", "86400"))  # 24 hours
+EXTERNAL_CALL_TIMEOUT   = int(os.getenv("EXTERNAL_CALL_TIMEOUT", "25"))
 
 if not GEMINI_API_KEY:   raise RuntimeError("❌ GEMINI_API_KEY is not set.")
 if not PINECONE_API_KEY: raise RuntimeError("❌ PINECONE_API_KEY is not set.")
@@ -118,20 +99,6 @@ def _check_rate_limit(ip: str) -> bool:
             _rate_limit_store[ip].append(now)
             return True
     return False
-
-# ──────────────────────────────────────────────────────────────────
-# Request ID Generator
-# ──────────────────────────────────────────────────────────────────
-import uuid
-_request_id_context = threading.local()
-
-def get_request_id() -> str:
-    if not hasattr(_request_id_context, 'id'):
-        _request_id_context.id = str(uuid.uuid4())[:8]
-    return _request_id_context.id
-
-def set_request_id(rid: str):
-    _request_id_context.id = rid
 
 # ──────────────────────────────────────────────────────────────────
 # Lazy SDKs
@@ -174,67 +141,36 @@ def _gemini_types():
     from google.genai import types
     return types
 
-# ──────────────────────────────────────────────────────────────────
-# Embedding Cache (LRU with TTL)
-# ──────────────────────────────────────────────────────────────────
-_embedding_cache: Dict[str, Tuple[List[float], float]] = {}
-_embedding_cache_lock = threading.Lock()
-
-def _get_cached_embedding(text: str) -> Optional[List[float]]:
-    with _embedding_cache_lock:
-        if text in _embedding_cache:
-            vec, ts = _embedding_cache[text]
-            if time.time() - ts < EMBEDDING_CACHE_TTL_SECONDS:
-                return vec
-            else:
-                del _embedding_cache[text]
-    return None
-
-def _cache_embedding(text: str, vec: List[float]) -> None:
-    with _embedding_cache_lock:
-        if len(_embedding_cache) >= EMBEDDING_CACHE_MAX_SIZE:
-            # Remove oldest entry (simple FIFO)
-            oldest_key = next(iter(_embedding_cache))
-            del _embedding_cache[oldest_key]
-        _embedding_cache[text] = (vec, time.time())
-
-# ──────────────────────────────────────────────────────────────────
-# SentenceTransformer (initialized in lifespan)
-# ──────────────────────────────────────────────────────────────────
 _st_model: Any = None
 _st_lock        = threading.Lock()
 _st_load_error: Optional[str] = None
 
-def _init_embedding_model() -> None:
-    """Initialize SentenceTransformer model (called during startup)."""
+def _load_and_encode_sync(text: str) -> List[float]:
     global _st_model, _st_load_error
-    with _st_lock:
-        if _st_model is None:
-            try:
-                log.info(f"🔄 Loading SentenceTransformer: {EMBED_MODEL}")
-                t0 = time.perf_counter()
-                from sentence_transformers import SentenceTransformer
-                model = SentenceTransformer(EMBED_MODEL, device="cpu")
-                try:
-                    import torch as _torch
-                    _torch.set_num_threads(1)
-                    _torch.set_num_interop_threads(1)
-                    _torch.set_grad_enabled(False)
-                except ImportError:
-                    _torch = None  # type: ignore
-                elapsed = time.perf_counter() - t0
-                log.info(f"✅ SentenceTransformer ready in {elapsed:.2f}s")
-                _st_model = model
-            except Exception as exc:
-                _st_load_error = str(exc)
-                log.error(f"❌ Failed to load SentenceTransformer: {exc}")
-                raise
-
-def _encode_sync(text: str) -> List[float]:
-    """Encode text to vector (model must be pre-initialized)."""
-    global _st_model
     if _st_model is None:
-        raise RuntimeError("❌ Embedding model not initialized")
+        with _st_lock:
+            if _st_model is None:
+                if _st_load_error:
+                    raise RuntimeError(f"❌ Embedder previously failed: {_st_load_error}")
+                try:
+                    log.info(f"🔄 Lazy-loading SentenceTransformer: {EMBED_MODEL}")
+                    t0 = time.perf_counter()
+                    from sentence_transformers import SentenceTransformer
+                    model = SentenceTransformer(EMBED_MODEL, device="cpu")
+                    try:
+                        import torch as _torch
+                        _torch.set_num_threads(1)
+                        _torch.set_num_interop_threads(1)
+                        _torch.set_grad_enabled(False)
+                    except ImportError:
+                        pass
+                    elapsed = time.perf_counter() - t0
+                    log.info(f"✅ SentenceTransformer ready in {elapsed:.2f}s")
+                    _st_model = model
+                except Exception as exc:
+                    _st_load_error = str(exc)
+                    log.error(f"❌ Failed to load SentenceTransformer: {exc}")
+                    raise
     try:
         vec: List[float] = _st_model.encode(
             text, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=False,
@@ -247,19 +183,10 @@ def _encode_sync(text: str) -> List[float]:
         raise
 
 async def _encode_async(text: str) -> List[float]:
-    """Async encoding with cache and graceful fallback."""
-    # Check cache first
-    cached = _get_cached_embedding(text)
-    if cached:
-        return cached
-    
     try:
-        vec = await asyncio.to_thread(_encode_sync, text)
-        _cache_embedding(text, vec)
-        return vec
+        return await asyncio.to_thread(_load_and_encode_sync, text)
     except Exception as exc:
-        log.warning(f"[Embedding] Failed: {exc} — will fallback to GEMINI_ONLY")
-        raise RuntimeError(f"Embedding unavailable: {exc}") from exc
+        raise RuntimeError(f"❌ Embedding unavailable: {exc}") from exc
 
 # ──────────────────────────────────────────────────────────────────
 # Constants
@@ -490,7 +417,6 @@ class AskRequest(BaseModel):
     question: Optional[str] = None
     text:     Optional[str] = None
     history:  Optional[List[MessageDto]] = None
-    language: Optional[str] = None
 
     @property
     def query(self) -> str:
@@ -661,22 +587,17 @@ class KnowledgeBaseService:
     # ── 🆕 v16.0: Hybrid search ────────────────────────────────────
     async def search(self, query: str, top_k: int = TOP_K) -> List["KnowledgeMatch"]:
         """Hybrid search: cosine + exact-match boost + category soft filter."""
-        rid = get_request_id()
-        log.info(f"[KB-v2] [{rid}] Searching: '{query[:80]}'")
+        log.info(f"[KB-v2] Searching: '{query[:80]}'")
 
         # Medical awareness layer
         expected_cats = _extract_expected_categories(query)
-        if expected_cats:
-            log.debug(f"[KB-v2] [{rid}] Expected categories: {expected_cats}")
+        log.info(f"[KB-v2] Expected categories: {expected_cats or ['unknown']}")
 
-        # Encode with timeout
+        # Encode
         try:
-            vector = await asyncio.wait_for(_encode_async(query), timeout=EMBEDDING_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.warning(f"[KB-v2] [{rid}] Encoding timeout after {EMBEDDING_TIMEOUT}s")
-            return []
+            vector = await _encode_async(query)
         except Exception as exc:
-            log.warning(f"[KB-v2] [{rid}] Encoding failed: {exc}")
+            log.error(f"[KB-v2] Encoding failed: {exc}")
             return []
 
         # Fetch 3× from Pinecone, then re-rank
@@ -689,26 +610,19 @@ class KnowledgeBaseService:
                     index.query, vector=vector, top_k=fetch_k,
                     include_metadata=True, namespace=PINECONE_NAMESPACE or "",
                 )
-                results = await asyncio.wait_for(
-                    asyncio.to_thread(_qfn),
-                    timeout=PINECONE_TIMEOUT
-                )
+                results = await asyncio.to_thread(_qfn)
 
                 raw_scores = [round(float(m.score), 4) for m in results.matches if m.score]
-                log.debug(f"[KB-v2] [{rid}] Raw scores: {raw_scores[:5]}...")
+                log.info(f"[KB-v2] Pinecone raw scores ({len(raw_scores)}): {raw_scores}")
 
                 return self._parse_matches_hybrid(results, query, expected_cats, top_k)
 
-            except asyncio.TimeoutError:
-                log.warning(f"[KB-v2] [{rid}] Pinecone timeout on attempt {attempt}/{MAX_RETRIES}")
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY * attempt)
             except Exception as exc:
-                log.warning(f"[KB-v2] [{rid}] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
+                log.warning(f"[KB-v2] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY * attempt)
 
-        log.warning(f"[KB-v2] [{rid}] All retries exhausted")
+        log.error("[KB-v2] All retries exhausted")
         return []
 
     # ── 🆕 v16.0: Hybrid re-ranking ────────────────────────────────
@@ -744,10 +658,10 @@ class KnowledgeBaseService:
             )
 
             icon = "🎯" if match_type == "exact" else "🔍" if match_type == "high_similarity" else "🌐"
-            log.debug(
+            log.info(
                 f"[KB-v2] {icon} {match_type:<16} cosine={cosine:.3f} "
                 f"exact_b={exact_b:.2f} cat_b={cat_b:.2f} → final={final:.4f} "
-                f"| cat={category}"
+                f"| cat={category} | q='{q_text[:50]}'"
             )
 
             candidates.append(KnowledgeMatch(
@@ -760,8 +674,9 @@ class KnowledgeBaseService:
         # Apply threshold on hybrid score
         kept = [c for c in candidates if c.confidence >= MIN_CONFIDENCE]
         log.info(
-            f"[KB-v2] Re-ranked: {len(kept)}/{len(candidates)} kept, "
-            f"{filtered} pre-filtered"
+            f"[KB-v2] Re-ranked: {len(kept)} kept "
+            f"(top={kept[0].confidence:.4f}), "
+            f"{len(candidates)-len(kept)} below threshold, {filtered} pre-filtered"
         )
         return kept[:top_k]
 
@@ -776,7 +691,7 @@ class KnowledgeBaseService:
         for m in matches[:3]:
             sim = _token_similarity(qn, _normalize_text(m.question))
             if sim >= EXACT_MATCH_THRESHOLD:
-                log.debug(f"[KB-v2] Relevance: exact match (sim={sim:.3f})")
+                log.info(f"[KB-v2] Relevance: ✅ exact match (sim={sim:.3f})")
                 return True
 
         # Fast path 2: category match
@@ -784,13 +699,13 @@ class KnowledgeBaseService:
         if expected and matches:
             top_cat = (matches[0].category or "").lower()
             if top_cat in [c.lower() for c in expected]:
-                log.debug(f"[KB-v2] Relevance: category match ({top_cat})")
+                log.info(f"[KB-v2] Relevance: ✅ category match ({top_cat})")
                 return True
 
         # Slow path: medical token overlap
         qt = KnowledgeBaseService._extract_medical_tokens(query)
         if not qt:
-            log.debug("[KB-v2] Relevance: no medical tokens — allowing")
+            log.info("[KB-v2] Relevance: no medical tokens — allowing")
             return True
 
         combined = " ".join(f"{m.question} {m.answer}" for m in matches[:3])
@@ -798,7 +713,7 @@ class KnowledgeBaseService:
         overlap  = len(qt & mt)
         ok       = overlap >= min_overlap
 
-        log.debug(
+        log.info(
             f"[KB-v2] Relevance: query_tokens={len(qt)} match_tokens={len(mt)} "
             f"overlap={overlap} → {'✅' if ok else '❌'}"
         )
@@ -1111,62 +1026,57 @@ class GeminiService:
         return await asyncio.to_thread(self._generate_sync, prompt)
 
     # ── Image analysis (unchanged) ──────────────────────────────────
-    async def analyze_image(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
-        """Analyze medical image using Gemini Vision with timeout."""
-        rid = get_request_id()
-        log.info(f"[Vision] [{rid}] Starting image analysis")
-        client = _get_gemini_sync()
-        types = _gemini_types()
-        prompt = (
-            "You are a medical assistant. Analyze this image and provide "
-            "a brief, medically relevant description. If the image is not "
-            "medically relevant, state that clearly. Keep the response "
-            "under 200 words."
+    def _analyze_image_sync(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
+        system_prompt = (
+            "You are a specialized medical image analysis AI.\n\n"
+            "You ONLY analyze medical images. Accepted types:\n"
+            "  - Lab results / blood tests\n  - Prescriptions / medical reports\n"
+            "  - X-rays, MRI, CT scans\n  - ECG / EKG strips\n"
+            "  - Pathology slides\n  - Ultrasound images\n\n"
+            "CRITICAL RULES:\n"
+            "1. If NOT medical → respond with JSON ONLY:\n"
+            '   {"status": "rejected", "analysis": "Not a medical image."}\n\n'
+            "2. If medical → respond with JSON ONLY:\n"
+            '   {"status": "success", "analysis": "<structured analysis>"}\n\n'
+            "3. Analysis must include: document type, key findings, abnormal values, "
+            "next steps, urgent findings.\n"
+            "4. NEVER provide a definitive diagnosis.\n"
+            "5. Respond in the SAME language as image content.\n"
+            "6. Output ONLY valid JSON — no markdown, no code fences."
         )
-        try:
-            image_part = types.Part.from_data(data=image_bytes, mime_type=mime_type)
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.models.generate_content,
-                    model="gemini-2.0-flash",
-                    contents=[prompt, image_part],
-                ),
-                timeout=GEMINI_TIMEOUT
-            )
-            log.info(f"[Vision] [{rid}] Analysis complete")
-            return response.text, "gemini-2.0-flash", "success"
-        except asyncio.TimeoutError:
-            log.error(f"[Vision] [{rid}] Timeout after {GEMINI_TIMEOUT}s")
-            raise RuntimeError("Image analysis timed out") from None
-        except Exception as exc:
-            log.error(f"[Vision] [{rid}] Analysis failed: {exc}")
-            raise RuntimeError(f"Image analysis failed: {exc}") from exc
+        b64_data = base64.b64encode(image_bytes).decode("utf-8")
+        types    = _gemini_types()
 
-    # ── Retry wrapper for Gemini text generation with timeout ──────────────────────────────
-    async def _generate_with_retry(self, prompt: str, model: str = "gemini-2.0-flash") -> str:
-        """Retry wrapper for Gemini text generation with timeout."""
-        rid = get_request_id()
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                client = _get_gemini_sync()
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model,
-                        contents=prompt,
-                    ),
-                    timeout=GEMINI_TIMEOUT
-                )
-                return response.text
-            except asyncio.TimeoutError:
-                log.warning(f"[Gemini] [{rid}] Timeout on attempt {attempt}/{MAX_RETRIES}")
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY * attempt)
-            except Exception as exc:
-                log.warning(f"[Gemini] [{rid}] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY * attempt)
-        raise RuntimeError("[Gemini] All retries exhausted")
+        for model_name in GEMINI_VISION_MODELS:
+            for contents in [
+                [system_prompt, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
+                [{"text": system_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}],
+            ]:
+                try:
+                    resp  = _get_gemini_sync().models.generate_content(
+                        model=model_name, contents=contents,
+                        config=self._make_config(temperature=0.1, max_tokens=4096),
+                    )
+                    raw   = resp.text.strip()
+                    clean = re.sub(r"^\s*```+(?:json)?\s*|\s*```+\s*$", "", raw, flags=re.MULTILINE).strip()
+                    brace = clean.find("{")
+                    if brace > 0: clean = clean[brace:]
+                    try:
+                        parsed   = json.loads(clean)
+                        status   = str(parsed.get("status", "success"))
+                        analysis = parsed.get("analysis", "")
+                        if not isinstance(analysis, str):
+                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                        return status, analysis.strip(), model_name
+                    except json.JSONDecodeError:
+                        return "success", raw, model_name
+                except Exception as exc:
+                    log.warning(f"[Vision] {model_name} failed: {exc}")
+
+        return "error", "تعذّر تحليل الصورة مؤقتاً. يرجى المحاولة لاحقاً.", "none"
+
+    async def analyze_image(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
+        return await asyncio.to_thread(self._analyze_image_sync, image_bytes, mime_type)
 
     @property
     def cache_size(self) -> int: return len(self._cache)
@@ -1176,46 +1086,24 @@ class GeminiService:
 # App State
 # ──────────────────────────────────────────────────────────────────
 class AppState:
-    knowledge_base:   Optional[KnowledgeBaseService] = None
-    gemini:           Optional[GeminiService]         = None
-    prompt_builder:   Optional[PromptBuilder]         = None
-    intent_classifier: Optional[IntentClassifier]      = None
-    emergency_detector: Optional[EmergencyDetector]   = None
+    knowledge_base: Optional[KnowledgeBaseService] = None
+    gemini:         Optional[GeminiService]         = None
+    prompt_builder: Optional[PromptBuilder]         = None
 
 state = AppState()
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     global _request_semaphore
     log.info("🚀 SILA v16.0 starting…")
     _request_semaphore   = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    
-    # Initialize embedding model (moved from lazy loading)
-    try:
-        _init_embedding_model()
-    except Exception as exc:
-        log.error(f"❌ Failed to initialize embedding model: {exc}")
-        raise
-    
-    # Warm-up: pre-encode sample query
-    try:
-        log.info("🔄 Warm-up: pre-encoding sample query...")
-        await _encode_async("sample medical query")
-        log.info("✅ Warm-up complete")
-    except Exception as exc:
-        log.warning(f"⚠️ Warm-up failed (non-critical): {exc}")
-    
-    state.knowledge_base   = KnowledgeBaseService()
-    state.gemini           = GeminiService()
-    state.prompt_builder   = PromptBuilder()
-    state.intent_classifier = IntentClassifier()
-    state.emergency_detector = EmergencyDetector()
-    
+    state.knowledge_base = KnowledgeBaseService()
+    state.gemini         = GeminiService()
+    state.prompt_builder = PromptBuilder()
     log.info(
         f"✅ Boot complete — embed={EMBED_MODEL} dim={EMBED_DIM} "
         f"min_confidence={MIN_CONFIDENCE} hybrid_weights=({WEIGHT_COSINE}/{WEIGHT_EXACT}/{WEIGHT_CATEGORY}) "
-        f"exact_threshold={EXACT_MATCH_THRESHOLD} index={INDEX_NAME} "
-        f"cache_size={EMBEDDING_CACHE_MAX_SIZE} cache_ttl={EMBEDDING_CACHE_TTL_SECONDS}s"
+        f"exact_threshold={EXACT_MATCH_THRESHOLD} index={INDEX_NAME}"
     )
     yield
     log.info("🛑 SILA shutting down")
@@ -1239,8 +1127,9 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     return JSONResponse(status_code=500, content={"error": "An unexpected error occurred."})
 
 @app.get("/")
-async def root():
-    return {"service": "Medical AI Assistant", "version": "16.0.0"}
+def root():
+    return {"name":"Sila — Medical AI","version":"16.0.0","status":"running ✅",
+            "endpoints":["/ask","/analyze-image","/health","/docs"]}
 
 @app.get("/health")
 def health():
@@ -1253,185 +1142,162 @@ def health():
     }}
 
 @app.post("/ask", response_model=AskResponse)
-async def ask_endpoint(req: AskRequest):
-    """Main RAG endpoint."""
-    # Generate request ID
-    rid = str(uuid.uuid4())[:8]
-    set_request_id(rid)
-    
-    client_host = req.client.host if req.client and req.client.host else "unknown"
-    if not _check_rate_limit(client_host):
-        raise HTTPException(status_code=429, detail="Too many requests")
+async def ask(req: AskRequest, request: Request) -> AskResponse:
+    if _request_semaphore is None:
+        return JSONResponse(status_code=503, content={"error":"Server not ready"})
 
-    async with _request_semaphore:
-        return await _ask_inner(req)
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        lang = LanguageDetector.detect(req.query)
+        msg  = ("لقد تجاوزت الحد المسموح من الطلبات." if lang=="ar"
+                else "Rate limit exceeded. Please try again in a minute.")
+        return JSONResponse(status_code=429, content={"error": msg})
 
-@app.post("/analyze-image", response_model=ImageAnalysisResponse)
-async def analyze_image_endpoint(file: UploadFile = File(...)):
-    """Analyze medical image."""
-    rid = str(uuid.uuid4())[:8]
-    set_request_id(rid)
-    log.info(f"[Image] [{rid}] Received file: {file.filename} ({file.content_type})")
-
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid image type")
-
-    content = await file.read()
-    if len(content) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Image too large")
-
+    await _request_semaphore.acquire()
     try:
-        result = await state.gemini.analyze_image(content, file.content_type)
-        return ImageAnalysisResponse(analysis=result[0], model_used=result[1], status=result[2])
-    except Exception as exc:
-        log.error(f"[Image] [{rid}] Analysis error: {exc}")
-        raise HTTPException(status_code=500, detail="Image analysis failed") from exc
+        return await asyncio.wait_for(_ask_inner(req), timeout=EXTERNAL_CALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        lang = LanguageDetector.detect(req.query)
+        msg  = ("عذراً، استغرق الطلب وقتاً أطول من المتوقع." if lang=="ar"
+                else "Request timed out. Please try again.")
+        return AskResponse(
+            query=req.query, reply=msg, model_used="none", matches=[],
+            is_medical=True, found_in_database=False, low_confidence=True,
+            language=lang, disclaimer=MEDICAL_DISCLAIMER,
+        )
+    finally:
+        try: _request_semaphore.release()
+        except Exception: pass
+
 
 async def _ask_inner(req: AskRequest) -> AskResponse:
-    """Core RAG decision engine (4-mode)."""
-    q = req.query.strip()
-    rid = get_request_id()
-    log.info(f"[Ask] [{rid}] Query: '{q[:100]}'")
+    start = time.time()
+    q     = req.query
+    lang  = LanguageDetector.detect(q)
+    intent= await IntentClassifier.classify(q)
+    log.info(f"[ASK] '{q[:80]}' | lang={lang} | intent={intent}")
 
-    # Initialize rag_mode
-    rag_mode = "GEMINI_ONLY"
-    language = req.language if req.language else LanguageDetector.detect(q)
+    # Social
+    if intent == "social":
+        reply, model = await state.gemini.reply_social(q, lang)
+        log.info(f"[ASK] ✅ Social — {model} | {round((time.time()-start)*1000)}ms")
+        return AskResponse(query=q, reply=reply, model_used=model, matches=[],
+                           is_medical=False, found_in_database=False, low_confidence=False,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
-    # 1. Intent classification
-    if state.intent_classifier:
-        intent = await state.intent_classifier.classify(q)
+    # Emergency check
+    is_emg = EmergencyDetector.is_emergency(q, lang)
+    if is_emg: log.warning("[ASK] 🚨 EMERGENCY")
+
+    # Retrieve
+    try:
+        raw_matches = await state.knowledge_base.search(q, top_k=TOP_K)
+    except Exception as exc:
+        log.error(f"[ASK] KB search failed: {exc}")
+        raw_matches = []
+
+    sanitized = KnowledgeBaseService._deduplicate_and_sanitize(raw_matches)
+    garbage_r = KnowledgeBaseService._calculate_garbage_ratio(raw_matches)
+    selected  = KnowledgeBaseService._select_top_matches(sanitized, MAX_CONTEXT_MATCHES)
+
+    top_score  = selected[0].confidence if selected else 0.0
+    cat_cons   = KnowledgeBaseService._category_consistency(selected)
+    rel_ok     = KnowledgeBaseService._relevance_ok(q, selected)
+
+    # 4-mode decision
+    if is_emg:
+        rag_mode = "EMERGENCY_OVERRIDE"; reason = "emergency"
+    elif not selected or top_score < MIN_CONFIDENCE:
+        rag_mode = "GEMINI_ONLY"; reason = f"no_matches(score={top_score:.3f})"
+    elif not rel_ok:
+        rag_mode = "GEMINI_ONLY"; reason = "relevance_guard"
+    elif garbage_r > 0.5:
+        rag_mode = "GEMINI_ONLY"; reason = f"garbage_ratio={garbage_r:.2f}"
+    elif top_score >= 0.80 and cat_cons >= 0.7:
+        rag_mode = "RAG_STRONG"; reason = f"high_conf={top_score:.3f}"
+    elif top_score >= MIN_CONFIDENCE:
+        rag_mode = "RAG_LIGHT"; reason = f"medium_conf={top_score:.3f}"
     else:
-        intent = "medical"  # Default fallback
-    log.info(f"[Ask] [{rid}] Intent: {intent}")
+        rag_mode = "GEMINI_ONLY"; reason = "fallback"
 
-    # 2. Emergency detection (always first)
-    if state.emergency_detector and state.emergency_detector.is_emergency(q, language):
-        log.warning(f"[Ask] [{rid}] ⚠️ EMERGENCY DETECTED")
-        emergency_prompt = state.prompt_builder.build_emergency(q, language) if state.prompt_builder else q
-        return AskResponse(
-            query=q,
-            reply=emergency_prompt,
-            model_used="emergency",
-            matches=[],
-            is_medical=True,
-            found_in_database=False,
-            low_confidence=False,
-            language=language,
-            disclaimer=MEDICAL_DISCLAIMER,
-        )
-
-    # 3. RAG retrieval
-    if not state.knowledge_base:
-        log.warning(f"[Ask] [{rid}] Knowledge base not initialized, using GEMINI_ONLY")
-        rag_mode = "GEMINI_ONLY"
-        matches = []
-    else:
-        matches = await state.knowledge_base.search(q, top_k=TOP_K)
-        log.info(f"[Ask] [{rid}] Retrieved {len(matches)} matches")
-
-        # 4. Quality filtering
-        garbage_ratio = sum(1 for m in matches if m.is_garbage) / max(len(matches), 1)
-        log.info(f"[Ask] [{rid}] Garbage ratio: {garbage_ratio:.2%}")
-        if garbage_ratio > 0.5:
-            log.warning(f"[Ask] [{rid}] Too much garbage, falling back to GEMINI_ONLY")
-            rag_mode = "GEMINI_ONLY"
-        else:
-            matches = [m for m in matches if not m.is_garbage]
-            matches = KnowledgeBaseService._deduplicate_and_sanitize(matches)
-            matches = KnowledgeBaseService._select_top_matches(matches, MAX_CONTEXT_MATCHES)
-
-        # 5. Relevance check
-        relevance_ok = KnowledgeBaseService._relevance_ok(q, matches) if state.knowledge_base else False
-        log.info(f"[Ask] [{rid}] Relevance: {'✅' if relevance_ok else '❌'}")
-
-    # 6. RAG decision engine
-    if rag_mode == "EMERGENCY_OVERRIDE":
-        # Already handled above
-        pass
-    elif not matches:
-        rag_mode = "GEMINI_ONLY"
-    elif not relevance_ok:
-        rag_mode = "GEMINI_ONLY"
-    elif len(matches) >= 2 and all(m.confidence >= 0.80 for m in matches):
-        rag_mode = "RAG_STRONG"
-    elif len(matches) >= 1 and any(m.confidence >= 0.70 for m in matches):
-        rag_mode = "RAG_LIGHT"
-    else:
-        rag_mode = "GEMINI_ONLY"
-
-    log.info(f"[Ask] [{rid}] RAG mode: {rag_mode}")
+    log.info(f"[ASK] 🎯 {rag_mode} — {reason} | top={top_score:.4f} "
+             f"garbage={garbage_r:.2f} rel={rel_ok} cat_cons={cat_cons:.2f}")
 
     match_results = [MatchResult(question=m.question, answer=m.answer,
                                  confidence=m.confidence, category=m.category)
-                     for m in matches]
+                     for m in selected]
 
     # Execute mode
-    async def _gen(prompt_text: str) -> Tuple[str, str]:
-        if not state.gemini:
-            fallback = state.prompt_builder.safe_fallback_response(language) if state.prompt_builder else "Service unavailable"
-            return fallback, "fallback"
-        return await state.gemini.generate(prompt_text)
+    async def _gen(prompt):
+        return await state.gemini.generate(prompt)
 
     if rag_mode == "EMERGENCY_OVERRIDE":
-        emergency_prompt = state.prompt_builder.build_emergency(q, language) if state.prompt_builder else q
-        return AskResponse(
-            query=q,
-            reply=emergency_prompt,
-            model_used="emergency",
-            matches=match_results,
-            is_medical=True,
-            found_in_database=False,
-            low_confidence=False,
-            language=language,
-            disclaimer=MEDICAL_DISCLAIMER,
-        )
+        reply, model = await _gen(state.prompt_builder.build_emergency(q, lang))
+        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                           is_medical=True, found_in_database=False, low_confidence=False,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
     if rag_mode == "RAG_STRONG":
-        ctx = QueryContext(raw_query=q, language=language, matches=matches)
-        prompt = state.prompt_builder.build(ctx) if state.prompt_builder else q
-        answer, model = await _gen(prompt)
-        return AskResponse(
-            query=q,
-            reply=answer,
-            model_used=model,
-            matches=match_results,
-            is_medical=True,
-            found_in_database=bool(matches),
-            low_confidence=False,
-            language=language,
-            disclaimer=MEDICAL_DISCLAIMER,
-        )
+        ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+        reply, model = await _gen(state.prompt_builder.build(ctx))
+        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                           is_medical=True, found_in_database=True, low_confidence=False,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
     if rag_mode == "RAG_LIGHT":
-        ctx = QueryContext(raw_query=q, language=language, matches=matches)
-        prompt = state.prompt_builder.build_rag_light(ctx) if state.prompt_builder else q
-        answer, model = await _gen(prompt)
-        return AskResponse(
-            query=q,
-            reply=answer,
-            model_used=model,
-            matches=match_results,
-            is_medical=True,
-            found_in_database=bool(matches),
-            low_confidence=True,
-            language=language,
-            disclaimer=MEDICAL_DISCLAIMER,
-        )
+        ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+        reply, model = await _gen(state.prompt_builder.build_rag_light(ctx))
+        return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                           is_medical=True, found_in_database=True, low_confidence=True,
+                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
 
     # GEMINI_ONLY
-    prompt = state.prompt_builder.build_gemini_only(q, language) if state.prompt_builder else q
-    answer, model = await _gen(prompt)
-    return AskResponse(
-        query=q,
-        reply=answer,
-        model_used=model,
-        matches=match_results,
-        is_medical=True,
-        found_in_database=bool(matches),
-        low_confidence=True,
-        language=language,
-        disclaimer=MEDICAL_DISCLAIMER,
-    )
+    reply, model = await _gen(state.prompt_builder.build_gemini_only(q, lang))
+    return AskResponse(query=q, reply=reply, model_used=model, matches=match_results,
+                       is_medical=True, found_in_database=False, low_confidence=True,
+                       language=lang, disclaimer=MEDICAL_DISCLAIMER)
+
+
+@app.post("/analyze-image", response_model=ImageAnalysisResponse)
+async def analyze_image(file: UploadFile = File(...)) -> JSONResponse:
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        return JSONResponse(status_code=400, content={
+            "status":"error",
+            "analysis":f"نوع الملف '{file.content_type}' غير مدعوم.",
+            "model_used":"none","disclaimer":MEDICAL_DISCLAIMER,
+        })
+    try:
+        image_bytes = await file.read()
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={
+            "status":"error","analysis":"فشل في قراءة الملف.",
+            "model_used":"none","disclaimer":MEDICAL_DISCLAIMER,
+        })
+    if not image_bytes:
+        return JSONResponse(status_code=400, content={
+            "status":"error","analysis":"الملف المرفوع فارغ.",
+            "model_used":"none","disclaimer":MEDICAL_DISCLAIMER,
+        })
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return JSONResponse(status_code=413, content={
+            "status":"error",
+            "analysis":f"حجم الصورة يتجاوز {MAX_IMAGE_MB}MB.",
+            "model_used":"none","disclaimer":MEDICAL_DISCLAIMER,
+        })
+    try:
+        status, analysis, model = await asyncio.wait_for(
+            state.gemini.analyze_image(image_bytes, file.content_type),
+            timeout=EXTERNAL_CALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={
+            "status":"error","analysis":"انتهت مهلة تحليل الصورة.",
+            "model_used":"none","disclaimer":MEDICAL_DISCLAIMER,
+        })
+    http_code = 200 if status == "success" else 503 if status == "error" else 200
+    return JSONResponse(status_code=http_code, content={
+        "status":status,"analysis":analysis,"model_used":model,"disclaimer":MEDICAL_DISCLAIMER,
+    })
 
 
 if __name__ == "__main__":
