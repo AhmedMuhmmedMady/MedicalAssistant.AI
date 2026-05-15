@@ -13,10 +13,11 @@ class IntentClassifier:
     _PROMPT = (
         "Classify this message into exactly one category.\n\n"
         "Categories:\n"
-        "- social  : greetings, thanks, casual conversation, non-medical\n"
-        "- medical : symptoms, diseases, medications, body, pain, health\n\n"
+        "- greeting    : hi, hello, how are you, casual greetings\n"
+        "- medical     : symptoms, diseases, medications, pain, human body\n"
+        "- non_medical : coding, sports, finance, general knowledge, unrelated topics\n\n"
         "Rules:\n"
-        "- Reply with ONE word only: social OR medical\n"
+        "- Reply with ONE word only: greeting, medical, OR non_medical\n"
         "- No punctuation, no explanation\n\n"
         "Message: {query}"
     )
@@ -28,10 +29,18 @@ class IntentClassifier:
         cache_key = f"intent_{hashlib.sha256(query.encode()).hexdigest()}"
         
         async def _compute():
-            q = query.lower()
+            q = query.lower().strip()
+            
+            # Fast-path for common greetings
+            greetings = ["سلام", "السلام عليكم", "ازيك", "عامل ايه", "هاي", "hello", "hi", "hey"]
+            if q in greetings or any(q.startswith(g + " ") for g in greetings):
+                log.info("[Intent] Greeting detected instantly")
+                return "greeting"
+                
             if any(kw in q for kw in MEDICAL_KEYWORDS):
                 log.info("[Intent] Medical keyword detected instantly")
                 return "medical"
+                
             try:
                 types = gemini_types()
                 client = get_gemini_sync()
@@ -54,10 +63,17 @@ class IntentClassifier:
                     
                 resp = await asyncio.wait_for(coro, timeout=10.0)
                 result = resp.text.strip().lower()
-                return "medical" if "medical" in result else "social"
+                
+                if "medical" in result and "non_medical" not in result:
+                    return "medical"
+                elif "greeting" in result:
+                    return "greeting"
+                elif "non_medical" in result:
+                    return "non_medical"
+                return "non_medical"
             except Exception as exc:
-                log.warning(f"[Intent] Gemini failed: {exc} — defaulting to medical for safety")
-                return "medical"
+                log.warning(f"[Intent] Gemini failed: {exc} — defaulting to non_medical for safety")
+                return "non_medical"
                 
         val, _ = await cls._cache.get_or_compute(cache_key, _compute)
         return val

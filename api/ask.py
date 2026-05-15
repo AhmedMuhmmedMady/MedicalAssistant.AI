@@ -78,12 +78,19 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
 
     log.info(f"[ASK] Intent classified as: {intent}")
 
-    if intent == "social":
+    if intent == "greeting":
         reply, model = await gemini_service.reply_social(q, lang)
-        log.info(f"[ASK] ✅ Social — {model} | {round((time.time()-start)*1000)}ms")
+        log.info(f"[ASK] ✅ Greeting — {model} | {round((time.time()-start)*1000)}ms")
         return AskResponse(query=q, reply=reply, model_used=model, matches=[],
                            is_medical=False, found_in_database=False, low_confidence=False,
-                           language=lang, disclaimer=MEDICAL_DISCLAIMER)
+                           language=lang, disclaimer="")
+
+    if intent == "non_medical":
+        reply = "أنا مساعد طبي متخصص 🏥\nأقدر أساعدك فقط في الأسئلة والاستفسارات الطبية." if lang == "ar" else "I am a specialized medical assistant. I can only help with medical-related questions."
+        log.info(f"[ASK] ❌ Non-Medical Rejection | {round((time.time()-start)*1000)}ms")
+        return AskResponse(query=q, reply=reply, model_used="none", matches=[],
+                           is_medical=False, found_in_database=False, low_confidence=False,
+                           language=lang, disclaimer="")
 
     try:
         raw_matches = await kb_service.search(q, top_k=TOP_K)
