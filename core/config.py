@@ -4,10 +4,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # External API Keys
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "AIzaSyB081UoYy107e9RQZS1YzSweZAj39sl2_k")
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "pcsk_3Bxu6E_HjF5cNUBvb5aQJ3qYmBmcGtfinhJuc1Gd1Kj5oJcxdQR4FtJjjJHFcMvzwxtPow")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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")
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "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")
 PRIMARY_MODEL      = os.getenv("PRIMARY_MODEL", "gemini")
 ENABLE_FALLBACK    = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
 
