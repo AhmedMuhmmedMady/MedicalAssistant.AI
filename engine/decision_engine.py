@@ -29,15 +29,19 @@ class IntentClassifier:
         cache_key = f"intent_{hashlib.sha256(query.encode()).hexdigest()}"
         
         async def _compute():
-            q = query.lower().strip()
+            q_lower = query.lower().strip()
+            
+            import string
+            q_norm = normalize_text(q_lower)
+            q_clean = q_norm.translate(str.maketrans('', '', string.punctuation)).strip()
             
             # Fast-path for common greetings
-            greetings = ["سلام", "السلام عليكم", "ازيك", "عامل ايه", "هاي", "hello", "hi", "hey"]
-            if q in greetings or any(q.startswith(g + " ") for g in greetings):
+            GREETING_KEYWORDS = ["صباح الخير", "صباح الفل", "مساء الخير", "ازيك", "عامل ايه", "اخبارك", "سلام", "السلام عليكم", "hi", "hello", "hey"]
+            if any(kw in q_clean for kw in GREETING_KEYWORDS):
                 log.info("[Intent] Greeting detected instantly")
                 return "greeting"
                 
-            if any(kw in q for kw in MEDICAL_KEYWORDS):
+            if any(kw in q_lower for kw in MEDICAL_KEYWORDS):
                 log.info("[Intent] Medical keyword detected instantly")
                 return "medical"
                 

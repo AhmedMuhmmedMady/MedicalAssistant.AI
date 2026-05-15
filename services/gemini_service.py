@@ -179,17 +179,18 @@ class GeminiService:
                             analysis = parsed.get("analysis", "")
                             if not isinstance(analysis, str):
                                 analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
-                            return status, analysis.strip(), model_name
+                            return status, analysis.strip(), "gemini-vision"
                         except json.JSONDecodeError:
-                            return "success", raw, model_name
+                            return "success", raw, "gemini-vision"
                     except asyncio.TimeoutError:
                         log.error(f"[Vision] {model_name} timed out on attempt {attempt+1}")
                     except Exception as exc:
+                        error_type = type(exc).__name__
                         error_str = str(exc).lower()
                         if "safety" in error_str or "blocked" in error_str:
-                            log.warning(f"[Vision] {model_name} blocked by safety filters.")
-                            return "fallback", "تعذر تحليل الصورة لأسباب أمنية أو لعدم وضوحها. يرجى استشارة الطبيب.", model_name
-                        log.warning(f"[Vision] {model_name} attempt {attempt+1} failed: {exc}")
+                            log.warning(f"[Vision] {model_name} blocked by safety filters. Type: {error_type}. Message: {exc}")
+                            return "fallback", "تعذر تحليل الصورة لأسباب أمنية أو لعدم وضوحها. يرجى استشارة الطبيب.", "gemini-vision"
+                        log.warning(f"[Vision] {model_name} attempt {attempt+1} failed. Type: {error_type}. Message: {exc}")
                         await asyncio.sleep(1.0)
 
             return "error", "تعذّر تحليل الصورة مؤقتاً بسبب ضغط السيرفر أو مشاكل تقنية. يرجى المحاولة لاحقاً.", "fallback"

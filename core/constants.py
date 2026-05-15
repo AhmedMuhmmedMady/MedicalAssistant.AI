@@ -1,7 +1,7 @@
 from typing import Dict, List
 
 GEMINI_TEXT_MODELS   = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
-GEMINI_VISION_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
+GEMINI_VISION_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 ALLOWED_IMAGE_TYPES = frozenset({
     "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
