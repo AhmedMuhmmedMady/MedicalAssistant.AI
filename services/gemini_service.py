@@ -20,6 +20,8 @@ def _init_gemini():
                 log.info("🔄 Initialising Gemini client…")
                 from google import genai as _genai
                 _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
+                log.info("✅ SDK type detected: google.genai")
+                log.info(f"✅ vision model selected: {GEMINI_VISION_MODELS[0]}")
                 log.info("✅ Gemini client ready.")
     return _gemini_client
 
