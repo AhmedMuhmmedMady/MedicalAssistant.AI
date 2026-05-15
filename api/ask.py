@@ -99,9 +99,15 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
                            language=lang, disclaimer="")
 
     if intent == "non_medical":
-        reply = "أنا مساعد طبي متخصص 🏥\nأقدر أساعدك فقط في الأسئلة والاستفسارات الطبية." if lang == "ar" else "I am a specialized medical assistant. I can only help with medical-related questions."
-        log.info(f"[ASK] ❌ Non-Medical Rejection | {round((time.time()-start)*1000)}ms")
-        return AskResponse(query=q, reply=reply, model_used="none", matches=[],
+        try:
+            res = await model_router.generate({"prompt": prompt_builder.build_non_medical(q, lang), "query": q, "language": lang})
+            reply, model = res["response"], res["model_used"]
+        except Exception:
+            reply = "أنا مساعد طبي متخصص 🏥\nأقدر أساعدك فقط في الأسئلة والاستفسارات الطبية." if lang == "ar" else "I am a specialized medical assistant. I can only help with medical-related questions."
+            model = "fallback"
+
+        log.info(f"[ASK] ✅ Non-Medical handled — {model} | {round((time.time()-start)*1000)}ms")
+        return AskResponse(query=q, reply=reply, model_used=model, matches=[],
                            is_medical=False, found_in_database=False, low_confidence=False,
                            language=lang, disclaimer="")
 

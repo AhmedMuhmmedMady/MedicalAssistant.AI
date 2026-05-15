@@ -53,9 +53,7 @@ class GeminiService:
             
             for model in GEMINI_TEXT_MODELS:
                 try:
-                    if model == "fallback_engine":
-                        fallback = "أهلاً! 😊 أنا سيلا، مساعدتك الطبية. كيف يمكنني مساعدتك؟" if language=="ar" else "Hello! 😊 I'm Sila, your medical AI. How can I help?"
-                        return fallback, "fallback_engine"
+
 
                     def _call():
                         return client.models.generate_content(
@@ -95,13 +93,7 @@ class GeminiService:
             for model in GEMINI_TEXT_MODELS:
                 try:
                     log.info(f"[Gemini] Trying model: {model}")
-                    if model == "fallback_engine":
-                        log.info(f"[Gemini] Fallback engine triggered")
-                        safe = (
-                            "بناءً على الأعراض المذكورة، قد تكون الحالة ناتجة عن عدة أسباب محتملة. "
-                            "يلزم فحص طبي دقيق. أنصح بمراجعة طبيب متخصص للتقييم المناسب. 🏥"
-                        )
-                        return safe, "fallback_engine"
+
 
                     def _call():
                         return client.models.generate_content(

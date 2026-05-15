@@ -32,62 +32,65 @@ class ModelRouter:
         # 1. Gemini
         if PRIMARY_MODEL == "gemini":
             try:
-                log.info("[Router] Attempting Gemini (Primary)")
+                log.info("MODEL_ATTEMPT: Gemini")
                 if image_bytes and mime_type:
                     status, reply, model = await self.gemini_service.analyze_image(image_bytes, mime_type)
                     if status == "error":
                         raise RuntimeError("Gemini image analysis failed")
                 else:
                     reply, model = await self.gemini_service.generate(prompt)
+                log.info("MODEL_SUCCESS: Gemini")
                 return {
                     "status": "success",
                     "model_used": model,
                     "response": reply
                 }
             except Exception as e:
-                log.error(f"[Router] Gemini failed: {e}")
+                log.error(f"MODEL_FAILED: Gemini | {e}")
                 if not ENABLE_FALLBACK:
                     return self._fallback_deterministic(query, language)
 
         # 2. OpenRouter
         try:
-            log.info("[Router] Attempting OpenRouter (Fallback 1)")
-            response = await self._call_openrouter(prompt, temperature, max_tokens, image_bytes)
+            log.info("MODEL_ATTEMPT: OpenRouter")
+            response = await self._call_openrouter(prompt, temperature, max_tokens, image_bytes, mime_type)
+            log.info("MODEL_SUCCESS: OpenRouter")
             return {
                 "status": "fallback",
-                "model_used": "openrouter-llama3.1-8b",
+                "model_used": "openrouter-fallback",
                 "response": response
             }
         except Exception as e:
-            log.error(f"[Router] OpenRouter failed: {e}")
+            log.error(f"MODEL_FAILED: OpenRouter | {e}")
 
         # 3. Groq
         try:
-            log.info("[Router] Attempting Groq (Fallback 2)")
-            response = await self._call_groq(prompt, temperature, max_tokens, image_bytes)
+            log.info("MODEL_ATTEMPT: Groq")
+            response = await self._call_groq(prompt, temperature, max_tokens, image_bytes, mime_type)
+            log.info("MODEL_SUCCESS: Groq")
             return {
                 "status": "fallback",
-                "model_used": "groq-llama3.1-70b",
+                "model_used": "groq-fallback",
                 "response": response
             }
         except Exception as e:
-            log.error(f"[Router] Groq failed: {e}")
+            log.error(f"MODEL_FAILED: Groq | {e}")
             
         # 4. Local Model (Rule-based RAG offline fallback)
         try:
-            log.info("[Router] Attempting Local/Deterministic Model (Fallback 3)")
-            return self._fallback_deterministic(query, language)
+            log.info("MODEL_ATTEMPT: LocalDeterministic")
+            res = self._fallback_deterministic(query, language)
+            log.info("MODEL_SUCCESS: LocalDeterministic")
+            return res
         except Exception as e:
-            log.error(f"[Router] Local model failed: {e}")
+            log.error(f"MODEL_FAILED: LocalDeterministic | {e}")
             return {
                 "status": "fallback",
                 "model_used": "deterministic-safeguard",
                 "response": "عذراً، أواجه مشكلة تقنية. يرجى استشارة طبيب متخصص." if language == "ar" else "Sorry, I am facing a technical issue. Please consult a medical professional."
             }
 
-    async def _call_openrouter(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None) -> str:
-        if image_bytes:
-            raise ValueError("Image payloads not supported by text-only OpenRouter model")
+    async def _call_openrouter(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None, mime_type: str = None) -> str:
         if not OPENROUTER_API_KEY:
             raise ValueError("OPENROUTER_API_KEY is not set")
             
@@ -95,9 +98,22 @@ class ModelRouter:
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json"
         }
+        
+        model_name = "meta-llama/llama-3.1-8b-instruct"
+        content = [{"type": "text", "text": prompt}]
+        
+        if image_bytes and mime_type:
+            import base64
+            model_name = "meta-llama/llama-3.2-90b-vision-instruct"
+            b64_img = base64.b64encode(image_bytes).decode('utf-8')
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}
+            })
+
         data = {
-            "model": "meta-llama/llama-3.1-8b-instruct",
-            "messages": [{"role": "user", "content": prompt}],
+            "model": model_name,
+            "messages": [{"role": "user", "content": content}],
             "temperature": temperature,
             "max_tokens": max_tokens
         }
@@ -107,9 +123,7 @@ class ModelRouter:
         result = response.json()
         return result["choices"][0]["message"]["content"].strip()
 
-    async def _call_groq(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None) -> str:
-        if image_bytes:
-            raise ValueError("Image payloads not supported by text-only Groq model")
+    async def _call_groq(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None, mime_type: str = None) -> str:
         if not GROQ_API_KEY:
             raise ValueError("GROQ_API_KEY is not set")
             
@@ -117,9 +131,22 @@ class ModelRouter:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
         }
+        
+        model_name = "llama-3.1-70b-versatile"
+        content = [{"type": "text", "text": prompt}]
+        
+        if image_bytes and mime_type:
+            import base64
+            model_name = "llama-3.2-90b-vision-preview"
+            b64_img = base64.b64encode(image_bytes).decode('utf-8')
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}
+            })
+
         data = {
-            "model": "llama-3.1-70b-versatile",
-            "messages": [{"role": "user", "content": prompt}],
+            "model": model_name,
+            "messages": [{"role": "user", "content": content}],
             "temperature": temperature,
             "max_tokens": max_tokens
         }
