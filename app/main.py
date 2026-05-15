@@ -21,7 +21,12 @@ async def lifespan(app: FastAPI):
     init_semaphore(MAX_CONCURRENT_REQUESTS)
     
     app.state.knowledge_base = KnowledgeBaseService()
-    app.state.gemini         = GeminiService()
+    gemini_service           = GeminiService()
+    app.state.gemini         = gemini_service
+    
+    from services.model_router import ModelRouter
+    app.state.model_router   = ModelRouter(gemini_service)
+    
     app.state.prompt_builder = PromptBuilder()
     
     log.info(
@@ -31,6 +36,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     log.info("🛑 SILA shutting down")
+    await app.state.model_router.close()
 
 app = FastAPI(
     title="Sila — Medical AI Assistant Modular",

@@ -62,6 +62,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
     kb_service: KnowledgeBaseService = request.app.state.knowledge_base
     gemini_service: GeminiService = request.app.state.gemini
+    model_router = request.app.state.model_router
     prompt_builder: PromptBuilder = request.app.state.prompt_builder
 
     start = time.time()
@@ -74,12 +75,24 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
         log.warning("[ASK] 🚨 EMERGENCY DETECTED INSTANTLY")
         intent = "medical"
     else:
-        intent = await IntentClassifier.classify(q)
+        intent = await IntentClassifier.classify(q, model_router)
 
     log.info(f"[ASK] Intent classified as: {intent}")
 
     if intent == "greeting":
-        reply, model = await gemini_service.reply_social(q, lang)
+        system = (
+            "أنت 'سيلا'، مساعد طبي ذكي وودود. رد بالعربية بشكل طبيعي ودافئ. الرد قصير (جملة أو اتنين)."
+            if lang == "ar" else
+            "You are 'Sila', a friendly medical AI. Reply naturally in English. Keep it brief (1-2 sentences)."
+        )
+        prompt = f"{system}\n\nUser: {q}"
+        try:
+            res = await model_router.generate({"prompt": prompt, "query": q, "language": lang})
+            reply, model = res["response"], res["model_used"]
+        except Exception:
+            reply = "أهلاً! 😊 أنا سيلا، مساعدتك الطبية. كيف يمكنني مساعدتك؟" if lang == "ar" else "Hello! 😊 I'm Sila, your medical AI. How can I help?"
+            model = "fallback"
+
         log.info(f"[ASK] ✅ Greeting — {model} | {round((time.time()-start)*1000)}ms")
         return AskResponse(query=q, reply=reply, model_used=model, matches=[],
                            is_medical=False, found_in_database=False, low_confidence=False,
@@ -126,7 +139,8 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
     try:
         if rag_mode == "EMERGENCY_OVERRIDE":
             try:
-                reply, model = await gemini_service.generate(prompt_builder.build_emergency(q, lang))
+                res = await model_router.generate({"prompt": prompt_builder.build_emergency(q, lang), "query": q, "language": lang})
+                reply, model = res["response"], res["model_used"]
                 log.info(f"[Model] ✅ Emergency response via {model}")
             except Exception as exc:
                 log.warning(f"[Model] Emergency generation failed: {exc} - fallback triggered")
@@ -143,17 +157,17 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
                 return _build_resp(reply, model, True, False)
             else:
                 ctx = QueryContext(raw_query=q, language=lang, matches=selected)
-                reply, model = await gemini_service.generate(prompt_builder.build(ctx))
-                return _build_resp(reply, model, True, False)
+                res = await model_router.generate({"prompt": prompt_builder.build(ctx), "query": q, "language": lang})
+                return _build_resp(res["response"], res["model_used"], True, False)
 
         elif rag_mode == "RAG_LIGHT":
             ctx = QueryContext(raw_query=q, language=lang, matches=selected)
-            reply, model = await gemini_service.generate(prompt_builder.build_rag_light(ctx))
-            return _build_resp(reply, model, True, True)
+            res = await model_router.generate({"prompt": prompt_builder.build_rag_light(ctx), "query": q, "language": lang})
+            return _build_resp(res["response"], res["model_used"], True, True)
 
         else: # GEMINI_ONLY
-            reply, model = await gemini_service.generate(prompt_builder.build_gemini_only(q, lang))
-            return _build_resp(reply, model, False, True)
+            res = await model_router.generate({"prompt": prompt_builder.build_gemini_only(q, lang), "query": q, "language": lang})
+            return _build_resp(res["response"], res["model_used"], False, True)
 
     except Exception as exc:
         log.error(f"[Model] Unhandled generation failure: {exc} - using deterministic fallback")

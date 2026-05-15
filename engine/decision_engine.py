@@ -25,7 +25,7 @@ class IntentClassifier:
     _cache = AsyncCache(maxsize=500)
 
     @classmethod
-    async def classify(cls, query: str) -> str:
+    async def classify(cls, query: str, model_router) -> str:
         cache_key = f"intent_{hashlib.sha256(query.encode()).hexdigest()}"
         
         async def _compute():
@@ -46,27 +46,15 @@ class IntentClassifier:
                 return "medical"
                 
             try:
-                types = gemini_types()
-                client = get_gemini_sync()
-                
-                def _call():
-                    return client.models.generate_content(
-                        model="gemini-2.0-flash-lite",
-                        contents=cls._PROMPT.format(query=query),
-                        config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=5),
-                    )
-                
-                if hasattr(client, "aio"):
-                    coro = client.aio.models.generate_content(
-                        model="gemini-2.0-flash-lite",
-                        contents=cls._PROMPT.format(query=query),
-                        config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=5)
-                    )
-                else:
-                    coro = asyncio.to_thread(_call)
-                    
-                resp = await asyncio.wait_for(coro, timeout=10.0)
-                result = resp.text.strip().lower()
+                payload = {
+                    "prompt": cls._PROMPT.format(query=query),
+                    "query": query,
+                    "language": "ar" if any("\u0600" <= c <= "\u06FF" for c in query) else "en",
+                    "temperature": 0.0,
+                    "max_tokens": 5
+                }
+                res = await model_router.generate(payload)
+                result = res["response"].strip().lower()
                 
                 if "medical" in result and "non_medical" not in result:
                     return "medical"
@@ -76,7 +64,7 @@ class IntentClassifier:
                     return "non_medical"
                 return "non_medical"
             except Exception as exc:
-                log.warning(f"[Intent] Gemini failed: {exc} — defaulting to non_medical for safety")
+                log.warning(f"[Intent] ModelRouter failed: {exc} — defaulting to non_medical for safety")
                 return "non_medical"
                 
         val, _ = await cls._cache.get_or_compute(cache_key, _compute)

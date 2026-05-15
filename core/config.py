@@ -6,6 +6,10 @@ load_dotenv()
 # External API Keys
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "AIzaSyC1LE3N84XeK9VIHdFxOp2NSnf4r6QEYfw")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "pcsk_3Bxu6E_HjF5cNUBvb5aQJ3qYmBmcGtfinhJuc1Gd1Kj5oJcxdQR4FtJjjJHFcMvzwxtPow")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+PRIMARY_MODEL      = os.getenv("PRIMARY_MODEL", "gemini")
+ENABLE_FALLBACK    = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
 
 if not GEMINI_API_KEY:   raise RuntimeError("❌ GEMINI_API_KEY is not set.")
 if not PINECONE_API_KEY: raise RuntimeError("❌ PINECONE_API_KEY is not set.")
