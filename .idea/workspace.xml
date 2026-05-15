@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="After Sleep Try">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="Change to Multiple Gemenini Models">
+      <change beforePath="$PROJECT_DIR$/ingest.log" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -55,8 +55,8 @@
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
-  <component name="RunManager" selected="Python.seed_pinecone">
-    <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+  <component name="RunManager" selected="Python.Old">
+    <configuration name="Old" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="MedicalAssistant.AI" />
       <option name="ENV_FILES" value="" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -72,7 +72,7 @@
       <option name="DEBUG_JUST_MY_CODE" value="false" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="RUN_TOOL" value="" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
+      <option name="SCRIPT_NAME" value="D:\Graduation Project\MedicalAssistant.AI\Old.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
@@ -137,7 +137,7 @@
       <workItem from="1778797645565" duration="1906000" />
       <workItem from="1778800729153" duration="3052000" />
       <workItem from="1778808794577" duration="7777000" />
-      <workItem from="1778818998583" duration="2514000" />
+      <workItem from="1778818998583" duration="11507000" />
     </task>
     <task id="LOCAL-00001" summary="&#10;full AI Chat Service">
       <option name="closed" value="true" />
@@ -491,7 +491,47 @@
       <option name="project" value="LOCAL" />
       <updated>1778819105332</updated>
     </task>
-    <option name="localTasksCounter" value="45" />
+    <task id="LOCAL-00045" summary="New Model">
+      <option name="closed" value="true" />
+      <created>1778860798162</created>
+      <option name="number" value="00045" />
+      <option name="presentableId" value="LOCAL-00045" />
+      <option name="project" value="LOCAL" />
+      <updated>1778860798162</updated>
+    </task>
+    <task id="LOCAL-00046" summary="Change GEMINI_TEXT_MODELS">
+      <option name="closed" value="true" />
+      <created>1778864842816</created>
+      <option name="number" value="00046" />
+      <option name="presentableId" value="LOCAL-00046" />
+      <option name="project" value="LOCAL" />
+      <updated>1778864842816</updated>
+    </task>
+    <task id="LOCAL-00047" summary="Change GEMINI_TEXT_MODELS">
+      <option name="closed" value="true" />
+      <created>1778866204758</created>
+      <option name="number" value="00047" />
+      <option name="presentableId" value="LOCAL-00047" />
+      <option name="project" value="LOCAL" />
+      <updated>1778866204758</updated>
+    </task>
+    <task id="LOCAL-00048" summary="Change to Multiple Gemenini Models">
+      <option name="closed" value="true" />
+      <created>1778869299828</created>
+      <option name="number" value="00048" />
+      <option name="presentableId" value="LOCAL-00048" />
+      <option name="project" value="LOCAL" />
+      <updated>1778869299828</updated>
+    </task>
+    <task id="LOCAL-00049" summary="Change to Multiple Gemenini Models">
+      <option name="closed" value="true" />
+      <created>1778869864875</created>
+      <option name="number" value="00049" />
+      <option name="presentableId" value="LOCAL-00049" />
+      <option name="project" value="LOCAL" />
+      <updated>1778869864875</updated>
+    </task>
+    <option name="localTasksCounter" value="50" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -512,9 +552,6 @@
     <ignored-roots>
       <path value="$PROJECT_DIR$/.." />
     </ignored-roots>
-    <MESSAGE value="New Better Code Version" />
-    <MESSAGE value="Fix Railway Naming" />
-    <MESSAGE value="Solve Question and Text Conflict" />
     <MESSAGE value="New Version" />
     <MESSAGE value="Make the Model Response is human" />
     <MESSAGE value="Ay Haga" />
@@ -537,7 +574,10 @@
     <MESSAGE value="Stronger More Free Answers Model" />
     <MESSAGE value="Free Answers Model" />
     <MESSAGE value="After Sleep Try" />
-    <option name="LAST_COMMIT_MESSAGE" value="After Sleep Try" />
+    <MESSAGE value="New Model" />
+    <MESSAGE value="Change GEMINI_TEXT_MODELS" />
+    <MESSAGE value="Change to Multiple Gemenini Models" />
+    <option name="LAST_COMMIT_MESSAGE" value="Change to Multiple Gemenini Models" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/MedicalAssistant_AI$main.coverage" NAME="main Coverage Results" MODIFIED="1778603392948" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
