@@ -53,6 +53,10 @@ class GeminiService:
             
             for model in GEMINI_TEXT_MODELS:
                 try:
+                    if model == "fallback_engine":
+                        fallback = "أهلاً! 😊 أنا سيلا، مساعدتك الطبية. كيف يمكنني مساعدتك؟" if language=="ar" else "Hello! 😊 I'm Sila, your medical AI. How can I help?"
+                        return fallback, "fallback_engine"
+
                     def _call():
                         return client.models.generate_content(
                             model=model, contents=query,
@@ -91,6 +95,14 @@ class GeminiService:
             for model in GEMINI_TEXT_MODELS:
                 try:
                     log.info(f"[Gemini] Trying model: {model}")
+                    if model == "fallback_engine":
+                        log.info(f"[Gemini] Fallback engine triggered")
+                        safe = (
+                            "بناءً على الأعراض المذكورة، قد تكون الحالة ناتجة عن عدة أسباب محتملة. "
+                            "يلزم فحص طبي دقيق. أنصح بمراجعة طبيب متخصص للتقييم المناسب. 🏥"
+                        )
+                        return safe, "fallback_engine"
+
                     def _call():
                         return client.models.generate_content(
                             model=model, contents=prompt, config=self._make_config()
@@ -117,17 +129,9 @@ class GeminiService:
                         log.error(f"[Gemini] ❌ {model} failed: {exc}")
             raise RuntimeError("All Gemini models failed")
 
-        try:
-            (reply, model), is_hit = await self._async_cache.get_or_compute(cache_key, _compute)
-            log.info(f"[Cache] {'HIT' if is_hit else 'MISS'} | [Gemini] ✅ Success — {model}")
-            return reply, model
-        except Exception as exc:
-            log.error(f"[Gemini] Fallback triggered: {exc}")
-            safe = (
-                "بناءً على الأعراض المذكورة، قد تكون الحالة ناتجة عن عدة أسباب محتملة. "
-                "يلزم فحص طبي دقيق. أنصح بمراجعة طبيب متخصص للتقييم المناسب. 🏥"
-            )
-            return safe, "safe_fallback"
+        (reply, model), is_hit = await self._async_cache.get_or_compute(cache_key, _compute)
+        log.info(f"[Cache] {'HIT' if is_hit else 'MISS'} | [Gemini] ✅ Success — {model}")
+        return reply, model
 
     async def analyze_image(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
         async def _compute():
