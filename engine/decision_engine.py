@@ -106,14 +106,16 @@ def generate_deterministic_fallback(query: str, language: str) -> str:
 def determine_rag_mode(is_emg: bool, selected_matches: List, top_score: float, rel_ok: bool, garbage_r: float, cat_cons: float) -> Tuple[str, str]:
     if is_emg:
         return "EMERGENCY_OVERRIDE", "emergency_keyword_match"
-    elif not selected_matches or top_score < MIN_CONFIDENCE:
+    elif not selected_matches:
+        return "GEMINI_ONLY", "no_matches"
+    elif top_score < MIN_CONFIDENCE:
         return "GEMINI_ONLY", f"no_valid_matches(score={top_score:.3f})"
     elif not rel_ok:
-        return "GEMINI_ONLY", "failed_relevance_guard"
+        return "RAG_LIGHT", "failed_relevance_but_has_matches"
     elif garbage_r > 0.5:
         return "GEMINI_ONLY", f"high_garbage_ratio={garbage_r:.2f}"
-    elif top_score >= 0.80 and cat_cons >= 0.7:
-        return "RAG_STRONG", f"high_confidence={top_score:.3f}_and_consistent"
+    elif top_score >= 0.65:
+        return "RAG_STRONG", f"high_confidence={top_score:.3f}"
     elif top_score >= MIN_CONFIDENCE:
         return "RAG_LIGHT", f"medium_confidence={top_score:.3f}"
     else:

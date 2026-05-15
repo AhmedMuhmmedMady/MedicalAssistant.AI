@@ -153,41 +153,46 @@ class GeminiService:
             contents = [system_prompt, part]
 
             for model_name in GEMINI_VISION_MODELS:
-                try:
-                    def _call():
-                        return client.models.generate_content(
-                            model=model_name, contents=contents,
-                            config=self._make_config(temperature=0.1, max_tokens=4096),
-                        )
-                    
-                    if hasattr(client, "aio"):
-                        coro = client.aio.models.generate_content(
-                            model=model_name, contents=contents,
-                            config=self._make_config(temperature=0.1, max_tokens=4096)
-                        )
-                    else:
-                        coro = asyncio.to_thread(_call)
-
-                    resp = await asyncio.wait_for(coro, timeout=EXTERNAL_CALL_TIMEOUT)
-                    raw   = resp.text.strip()
-                    clean = re.sub(r"^\s*```+(?:json)?\s*|\s*```+\s*$", "", raw, flags=re.MULTILINE).strip()
-                    brace = clean.find("{")
-                    if brace > 0: clean = clean[brace:]
+                for attempt in range(2):
                     try:
-                        parsed   = json.loads(clean)
-                        status   = str(parsed.get("status", "success"))
-                        analysis = parsed.get("analysis", "")
-                        if not isinstance(analysis, str):
-                            analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
-                        return status, analysis.strip(), model_name
-                    except json.JSONDecodeError:
-                        return "success", raw, model_name
-                except asyncio.TimeoutError:
-                    log.error(f"[Vision] {model_name} timed out")
-                except Exception as exc:
-                    log.warning(f"[Vision] {model_name} failed: {exc}")
+                        if hasattr(client, "aio"):
+                            coro = client.aio.models.generate_content(
+                                model=model_name, contents=contents,
+                                config=self._make_config(temperature=0.1, max_tokens=4096)
+                            )
+                        else:
+                            def _call():
+                                return client.models.generate_content(
+                                    model=model_name, contents=contents,
+                                    config=self._make_config(temperature=0.1, max_tokens=4096),
+                                )
+                            coro = asyncio.to_thread(_call)
+    
+                        resp = await asyncio.wait_for(coro, timeout=EXTERNAL_CALL_TIMEOUT)
+                        raw   = resp.text.strip()
+                        clean = re.sub(r"^\s*```+(?:json)?\s*|\s*```+\s*$", "", raw, flags=re.MULTILINE).strip()
+                        brace = clean.find("{")
+                        if brace > 0: clean = clean[brace:]
+                        try:
+                            parsed   = json.loads(clean)
+                            status   = str(parsed.get("status", "success"))
+                            analysis = parsed.get("analysis", "")
+                            if not isinstance(analysis, str):
+                                analysis = json.dumps(analysis, ensure_ascii=False, indent=2)
+                            return status, analysis.strip(), model_name
+                        except json.JSONDecodeError:
+                            return "success", raw, model_name
+                    except asyncio.TimeoutError:
+                        log.error(f"[Vision] {model_name} timed out on attempt {attempt+1}")
+                    except Exception as exc:
+                        error_str = str(exc).lower()
+                        if "safety" in error_str or "blocked" in error_str:
+                            log.warning(f"[Vision] {model_name} blocked by safety filters.")
+                            return "fallback", "تعذر تحليل الصورة لأسباب أمنية أو لعدم وضوحها. يرجى استشارة الطبيب.", model_name
+                        log.warning(f"[Vision] {model_name} attempt {attempt+1} failed: {exc}")
+                        await asyncio.sleep(1.0)
 
-            return "error", "تعذّر تحليل الصورة مؤقتاً. يرجى المحاولة لاحقاً.", "none"
+            return "error", "تعذّر تحليل الصورة مؤقتاً بسبب ضغط السيرفر أو مشاكل تقنية. يرجى المحاولة لاحقاً.", "fallback"
         return await _compute()
 
     @property

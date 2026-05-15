@@ -157,6 +157,11 @@ class KnowledgeBaseService:
         from core.config import EXACT_MATCH_THRESHOLD
         
         if not matches: return False
+        
+        if matches[0].confidence >= 0.55:
+            log.info(f"[Relevance] ✅ High semantic confidence bypass (score={matches[0].confidence:.3f})")
+            return True
+            
         qn = normalize_text(query)
         for m in matches[:3]:
             sim = token_similarity(qn, normalize_text(m.question))

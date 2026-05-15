@@ -22,6 +22,9 @@ async def analyze_image(request: Request, file: UploadFile = File(...)) -> JSONR
     try:
         status, analysis, model = await asyncio.wait_for(gemini_service.analyze_image(image_bytes, file.content_type), timeout=EXTERNAL_CALL_TIMEOUT)
     except asyncio.TimeoutError:
-        return JSONResponse(status_code=504, content={"status":"error","analysis":"انتهت مهلة تحليل الصورة.","model_used":"none","disclaimer":MEDICAL_DISCLAIMER})
-    http_code = 200 if status == "success" else 503 if status == "error" else 200
-    return JSONResponse(status_code=http_code, content={"status":status,"analysis":analysis,"model_used":model,"disclaimer":MEDICAL_DISCLAIMER})
+        return JSONResponse(status_code=200, content={"status":"fallback","analysis":"انتهت مهلة تحليل الصورة، يرجى المحاولة مرة أخرى أو استشارة طبيب.","model_used":"timeout","disclaimer":MEDICAL_DISCLAIMER})
+        
+    if status == "error":
+        status = "fallback"
+        
+    return JSONResponse(status_code=200, content={"status":status,"analysis":analysis,"model_used":model,"disclaimer":MEDICAL_DISCLAIMER})
