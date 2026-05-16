@@ -18,8 +18,23 @@ def init_semaphore(max_concurrent: int):
     global _request_semaphore
     _request_semaphore = asyncio.Semaphore(max_concurrent)
 
-def check_rate_limit(ip: str) -> bool:
+async def check_rate_limit(ip: str) -> bool:
+    from utils.cache import redis_client
     now = time.time()
+    
+    if redis_client:
+        try:
+            key = f"rate_limit:{ip}"
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.zremrangebyscore(key, 0, now - RATE_LIMIT_WINDOW)
+                pipe.zadd(key, {str(now): now})
+                pipe.zcard(key)
+                pipe.expire(key, RATE_LIMIT_WINDOW)
+                _, _, req_count, _ = await pipe.execute()
+            return req_count <= RATE_LIMIT_REQUESTS
+        except Exception:
+            pass # fallback to in-memory if Redis fails
+
     with _rate_limit_lock:
         if ip not in _rate_limit_store:
             _rate_limit_store[ip] = []

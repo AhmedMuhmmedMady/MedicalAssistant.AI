@@ -30,7 +30,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
         return JSONResponse(status_code=503, content={"error":"Server not ready"})
 
     client_ip = request.client.host if request.client else "unknown"
-    if not check_rate_limit(client_ip):
+    if not await check_rate_limit(client_ip):
         lang = LanguageDetector.detect(req.query)
         msg  = ("لقد تجاوزت الحد المسموح من الطلبات." if lang=="ar" else "Rate limit exceeded. Please try again in a minute.")
         return JSONResponse(status_code=429, content={"error": msg})
@@ -81,16 +81,18 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
 
     if intent == "greeting":
         system = (
-            "أنت 'سيلا'، مساعد طبي ذكي وودود. رد بالعربية بشكل طبيعي ودافئ. الرد قصير (جملة أو اتنين)."
+            "أنت 'ماضي'، مساعد طبي ذكي، لطيف جداً وودود. المستخدم يلقي التحية. "
+            "رد بترحيب حار جداً ومبهج باللغة العربية، واستخدم الإيموجي (مثل 😊, 🩺, 💙). "
+            "اسأله كيف يمكنك مساعدته في الاطمئنان على صحته اليوم. اجعل الرد قصيراً."
             if lang == "ar" else
-            "You are 'Sila', a friendly medical AI. Reply naturally in English. Keep it brief (1-2 sentences)."
+            "You are 'Mady', a very friendly medical AI. Reply to the greeting with a warm, cheerful welcome using emojis (like 😊, 🩺). Ask how you can help with their health today. Keep it brief."
         )
         prompt = f"{system}\n\nUser: {q}"
         try:
             res = await model_router.generate({"prompt": prompt, "query": q, "language": lang})
             reply, model = res["response"], res["model_used"]
         except Exception:
-            reply = "أهلاً! 😊 أنا سيلا، مساعدتك الطبية. كيف يمكنني مساعدتك؟" if lang == "ar" else "Hello! 😊 I'm Sila, your medical AI. How can I help?"
+            reply = "أهلاً بك! 😊 أنا ماضي، مساعدك الطبي الذكي. أتمنى أن تكون بصحة جيدة! 💙 كيف يمكنني أن أساعدك أو أطمئن عليك اليوم؟ 🩺" if lang == "ar" else "Hello! 😊 I'm Mady, your medical AI. How can I help you today? 🩺"
             model = "fallback"
 
         log.info(f"[ASK] ✅ Greeting — {model} | {round((time.time()-start)*1000)}ms")
@@ -103,7 +105,7 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
             res = await model_router.generate({"prompt": prompt_builder.build_non_medical(q, lang), "query": q, "language": lang})
             reply, model = res["response"], res["model_used"]
         except Exception:
-            reply = "أنا مساعد طبي متخصص 🏥\nأقدر أساعدك فقط في الأسئلة والاستفسارات الطبية." if lang == "ar" else "I am a specialized medical assistant. I can only help with medical-related questions."
+            reply = "أهلاً بك! 💙 أنا ماضي، متخصص فقط في الاستشارات والمجالات الطبية 🏥. لا أستطيع الإجابة على الأسئلة العامة، لكنني هنا دائماً لو احتجت أي نصيحة تخص صحتك! 😊" if lang == "ar" else "Hi! 💙 I'm Mady, a specialized medical AI 🏥. I can only answer health-related questions, but I'm here if you need any medical advice! 😊"
             model = "fallback"
 
         log.info(f"[ASK] ✅ Non-Medical handled — {model} | {round((time.time()-start)*1000)}ms")

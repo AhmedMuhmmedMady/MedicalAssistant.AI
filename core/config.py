@@ -14,9 +14,10 @@ ENABLE_FALLBACK    = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
 if not GEMINI_API_KEY:   raise RuntimeError("❌ GEMINI_API_KEY is not set.")
 if not PINECONE_API_KEY: raise RuntimeError("❌ PINECONE_API_KEY is not set.")
 
-# Index Config
+# Index & Caching Config
 INDEX_NAME         = os.getenv("PINECONE_INDEX", "medical-index-arabicdata")
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
+REDIS_URL          = os.getenv("REDIS_URL", "")
 
 # RAG & Embeddings
 MIN_CONFIDENCE   = float(os.getenv("SCORE_THRESHOLD", "0.60"))

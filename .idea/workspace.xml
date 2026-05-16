@@ -3,12 +3,13 @@
   <component name="ChangeListManager">
     <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="New Fixes">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/constants.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/constants.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/ask.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/ask.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rag/prompt_builder.py" beforeDir="false" afterPath="$PROJECT_DIR$/rag/prompt_builder.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/services/gemini_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/gemini_service.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/services/knowledge_base.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/knowledge_base.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/services/model_router.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/model_router.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/utils/cache.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/cache.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/text.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/text.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/concurrency.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/concurrency.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -145,22 +146,6 @@
       <workItem from="1778800729153" duration="3052000" />
       <workItem from="1778808794577" duration="7777000" />
       <workItem from="1778818998583" duration="18518000" />
-    </task>
-    <task id="LOCAL-00010" summary="New Version">
-      <option name="closed" value="true" />
-      <created>1778700958702</created>
-      <option name="number" value="00010" />
-      <option name="presentableId" value="LOCAL-00010" />
-      <option name="project" value="LOCAL" />
-      <updated>1778700958702</updated>
-    </task>
-    <task id="LOCAL-00011" summary="Make the Model Response is human">
-      <option name="closed" value="true" />
-      <created>1778703064671</created>
-      <option name="number" value="00011" />
-      <option name="presentableId" value="LOCAL-00011" />
-      <option name="project" value="LOCAL" />
-      <updated>1778703064671</updated>
     </task>
     <task id="LOCAL-00012" summary="Ay Haga">
       <option name="closed" value="true" />
@@ -538,7 +523,23 @@
       <option name="project" value="LOCAL" />
       <updated>1778957083315</updated>
     </task>
-    <option name="localTasksCounter" value="59" />
+    <task id="LOCAL-00059" summary="New Fixes">
+      <option name="closed" value="true" />
+      <created>1778957651676</created>
+      <option name="number" value="00059" />
+      <option name="presentableId" value="LOCAL-00059" />
+      <option name="project" value="LOCAL" />
+      <updated>1778957651676</updated>
+    </task>
+    <task id="LOCAL-00060" summary="New Fixes">
+      <option name="closed" value="true" />
+      <created>1778958015425</created>
+      <option name="number" value="00060" />
+      <option name="presentableId" value="LOCAL-00060" />
+      <option name="project" value="LOCAL" />
+      <updated>1778958015425</updated>
+    </task>
+    <option name="localTasksCounter" value="61" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">

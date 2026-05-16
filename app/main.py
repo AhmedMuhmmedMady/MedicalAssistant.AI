@@ -17,7 +17,7 @@ from api.health import router as health_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 SILA v17.4 (Modular) starting…")
+    log.info("🚀 MADY v17.4 (Modular) starting…")
     init_semaphore(MAX_CONCURRENT_REQUESTS)
     
     app.state.knowledge_base = KnowledgeBaseService()
@@ -35,12 +35,12 @@ async def lifespan(app: FastAPI):
         f"exact_threshold={EXACT_MATCH_THRESHOLD} index={INDEX_NAME}"
     )
     yield
-    log.info("🛑 SILA shutting down")
+    log.info("🛑 MADY shutting down")
     await app.state.model_router.close()
 
 app = FastAPI(
-    title="Sila — Medical AI Assistant Modular",
-    description="RAG-First Hybrid · Deterministic Fallback · Arabic & English",
+    title="Mady — Medical AI Assistant Modular",
+    description="Backend API for Mady Health AI with Hybrid RAG & Model Routing.",
     version="17.4.0",
     lifespan=lifespan,
 )
@@ -54,7 +54,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 @app.get("/")
 def root():
-    return {"name":"Sila — Medical AI","version":"17.4.0","status":"running ✅",
+    return {"name":"Mady — Medical AI","version":"17.4.0","status":"running ✅",
             "endpoints":["/ask","/analyze-image","/health","/docs"]}
 
 app.include_router(health_router)

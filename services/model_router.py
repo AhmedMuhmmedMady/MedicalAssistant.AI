@@ -53,7 +53,14 @@ class ModelRouter:
         # 2. Groq
         try:
             log.info("MODEL_ATTEMPT: Groq")
-            response = await self._call_groq(prompt, temperature, max_tokens, image_bytes, mime_type)
+            model_name = "llama-3.2-90b-vision-preview" if (image_bytes and mime_type) else "llama-3.3-70b-versatile"
+            response = await self._call_openai_compatible(
+                base_url="https://api.groq.com/openai/v1/chat/completions",
+                api_key=GROQ_API_KEY,
+                model_name=model_name,
+                prompt=prompt, temperature=temperature, max_tokens=max_tokens,
+                image_bytes=image_bytes, mime_type=mime_type
+            )
             log.info("MODEL_SUCCESS: Groq")
             return {
                 "status": "fallback",
@@ -66,7 +73,16 @@ class ModelRouter:
         # 3. OpenRouter
         try:
             log.info("MODEL_ATTEMPT: OpenRouter")
-            response = await self._call_openrouter(prompt, temperature, max_tokens, image_bytes, mime_type)
+            model_name = "google/gemini-2.5-flash" if (image_bytes and mime_type) else "meta-llama/llama-3.1-8b-instruct"
+            extra_headers = {"HTTP-Referer": "https://your-domain.com", "X-Title": "Mady Medical AI"}
+            response = await self._call_openai_compatible(
+                base_url="https://openrouter.ai/api/v1/chat/completions",
+                api_key=OPENROUTER_API_KEY,
+                model_name=model_name,
+                prompt=prompt, temperature=temperature, max_tokens=max_tokens,
+                image_bytes=image_bytes, mime_type=mime_type,
+                extra_headers=extra_headers
+            )
             log.info("MODEL_SUCCESS: OpenRouter")
             return {
                 "status": "fallback",
@@ -90,23 +106,25 @@ class ModelRouter:
                 "response": "عذراً، أواجه مشكلة تقنية. يرجى استشارة طبيب متخصص." if language == "ar" else "Sorry, I am facing a technical issue. Please consult a medical professional."
             }
 
-    async def _call_openrouter(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None, mime_type: str = None) -> str:
-        if not OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY is not set")
+    async def _call_openai_compatible(
+        self, base_url: str, api_key: str, model_name: str, 
+        prompt: str, temperature: float, max_tokens: int, 
+        image_bytes: bytes = None, mime_type: str = None, 
+        extra_headers: dict = None
+    ) -> str:
+        if not api_key:
+            raise ValueError(f"API key is not set for {base_url}")
             
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "HTTP-Referer": "https://your-domain.com",
-            "X-Title": "Sila Medical AI",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        
-        model_name = "meta-llama/llama-3.1-8b-instruct"
-        
+        if extra_headers:
+            headers.update(extra_headers)
+            
         if image_bytes and mime_type:
             if not prompt: prompt = "قم بتحليل هذه الصورة الطبية واستخراج الأسباب المحتملة، علامات الخطر، والتوصيات بدقة باللغة العربية."
             import base64
-            model_name = "google/gemini-2.5-flash"
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
             content = [
                 {"type": "text", "text": prompt},
@@ -122,42 +140,7 @@ class ModelRouter:
             "max_tokens": max_tokens
         }
         
-        response = await self.client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
-
-    async def _call_groq(self, prompt: str, temperature: float, max_tokens: int, image_bytes: bytes = None, mime_type: str = None) -> str:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY is not set")
-            
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        model_name = "llama-3.3-70b-versatile"
-        
-        if image_bytes and mime_type:
-            if not prompt: prompt = "قم بتحليل هذه الصورة الطبية واستخراج الأسباب المحتملة، علامات الخطر، والتوصيات بدقة باللغة العربية."
-            import base64
-            model_name = "llama-3.2-90b-vision-preview"
-            b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}}
-            ]
-        else:
-            content = prompt
-
-        data = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        
-        response = await self.client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data)
+        response = await self.client.post(base_url, headers=headers, json=data)
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"].strip()

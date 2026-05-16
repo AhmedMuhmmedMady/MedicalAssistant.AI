@@ -44,9 +44,9 @@ class GeminiService:
         
         async def _compute():
             system = (
-                "أنت 'سيلا'، مساعد طبي ذكي وودود. رد بالعربية بشكل طبيعي ودافئ. الرد قصير (جملة أو اتنين)."
+                "أنت 'ماضي'، مساعد طبي ذكي وودود. رد بالعربية بشكل طبيعي ودافئ. الرد قصير (جملة أو اتنين)."
                 if language == "ar" else
-                "You are 'Sila', a friendly medical AI. Reply naturally in English. Keep it brief (1-2 sentences)."
+                "You are 'Mady', a friendly medical AI. Reply naturally in English. Keep it brief (1-2 sentences)."
             )
             types = gemini_types()
             client = get_gemini_sync()
@@ -82,7 +82,7 @@ class GeminiService:
             val, _ = await self._async_cache.get_or_compute(cache_key, _compute)
             return val
         except Exception:
-            fallback = "أهلاً! 😊 أنا سيلا، مساعدتك الطبية. كيف يمكنني مساعدتك؟" if language=="ar" else "Hello! 😊 I'm Sila, your medical AI. How can I help?"
+            fallback = "أهلاً! 😊 أنا ماضي، مساعدك الطبي. كيف يمكنني مساعدتك؟" if language=="ar" else "Hello! 😊 I'm Mady, your medical AI. How can I help?"
             return fallback, "fallback"
 
     async def generate(self, prompt: str) -> Tuple[str, str]:
