@@ -68,50 +68,55 @@ class KnowledgeBaseService:
                 out.add(tok)
         return out
 
-    _search_cache = {}
+    def __init__(self):
+        from utils.cache import AsyncCache
+        self._async_cache = AsyncCache(200)
 
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
-        cache_key = f"{query}_{top_k}"
-        if cache_key in self._search_cache:
-            log.info(f"[KB-v2] Cache hit for '{query[:30]}'")
-            return self._search_cache[cache_key]
+        cache_key = f"{top_k}_{query}"
+        
+        async def _compute_search():
+            log.info(f"[KB-v2] Searching: '{query[:80]}'")
+            expected_cats = _extract_expected_categories(query)
+            log.info(f"[KB-v2] Expected categories: {expected_cats or ['unknown']}")
 
-        log.info(f"[KB-v2] Searching: '{query[:80]}'")
-        expected_cats = _extract_expected_categories(query)
-        log.info(f"[KB-v2] Expected categories: {expected_cats or ['unknown']}")
+            try:
+                vector = await encode_async(query)
+            except Exception as exc:
+                log.error(f"[KB-v2] Encoding failed: {exc}")
+                return []
 
-        try:
-            vector = await encode_async(query)
-        except Exception as exc:
-            log.error(f"[KB-v2] Encoding failed: {exc}")
+            index   = await get_index()
+            fetch_k = min(top_k * 3, 30)
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    def _call():
+                        return index.query(
+                            vector=vector, top_k=fetch_k,
+                            include_metadata=True, namespace=PINECONE_NAMESPACE or ""
+                        )
+                    results = await asyncio.wait_for(asyncio.to_thread(_call), timeout=10.0)
+
+                    raw_scores = [round(float(m.score), 4) for m in results.matches if m.score]
+                    log.info(f"[KB-v2] Pinecone raw scores ({len(raw_scores)}): {raw_scores}")
+
+                    res = self._parse_matches_hybrid(results, query, expected_cats, fetch_k)
+                    res = self._deduplicate_and_sanitize(res)
+                    return res[:top_k]
+
+                except Exception as exc:
+                    log.warning(f"[KB-v2] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(RETRY_DELAY * attempt)
+
+            log.error("[KB-v2] All retries exhausted")
             return []
 
-        index   = await get_index()
-        fetch_k = min(top_k * 3, 30)
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                def _call():
-                    return index.query(
-                        vector=vector, top_k=fetch_k,
-                        include_metadata=True, namespace=PINECONE_NAMESPACE or ""
-                    )
-                results = await asyncio.wait_for(asyncio.to_thread(_call), timeout=10.0)
-
-                raw_scores = [round(float(m.score), 4) for m in results.matches if m.score]
-                log.info(f"[KB-v2] Pinecone raw scores ({len(raw_scores)}): {raw_scores}")
-
-                res = self._parse_matches_hybrid(results, query, expected_cats, top_k)
-                self._search_cache[cache_key] = res
-                return res
-
-            except Exception as exc:
-                log.warning(f"[KB-v2] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY * attempt)
-
-        log.error("[KB-v2] All retries exhausted")
-        return []
+        res, is_hit = await self._async_cache.get_or_compute(cache_key, _compute_search)
+        if is_hit:
+            log.info(f"[KB-v2] Cache hit for '{query[:30]}'")
+        return res
 
     @staticmethod
     def _parse_matches_hybrid(
@@ -124,6 +129,7 @@ class KnowledgeBaseService:
             cosine = float(m.score) if m.score is not None else 0.0
             if cosine < MIN_CONFIDENCE * 0.80:
                 filtered += 1
+                log.info(f"[KB-v2] REJECTED | raw={cosine:.4f} < pre-filter threshold | q='{m.metadata.get('question', '')[:30]}'")
                 continue
 
             meta     = m.metadata or {}
@@ -137,12 +143,15 @@ class KnowledgeBaseService:
                 match_category=category, expected_categories=expected_cats,
             )
 
-            icon = "🎯" if match_type == "exact" else "🔍" if match_type == "high_similarity" else "🌐"
-            log.info(
-                f"[KB-v2] {icon} {match_type:<16} cosine={cosine:.3f} "
-                f"semantic={semantic:.2f} cat_b={cat_b:.2f} → final={final:.4f} "
-                f"| cat={category} | q='{q_text[:50]}'"
-            )
+            if final < MIN_CONFIDENCE:
+                log.info(f"[KB-v2] REJECTED | raw={cosine:.4f} reranked={final:.4f} < threshold | q='{q_text[:30]}'")
+            else:
+                icon = "🎯" if match_type == "exact" else "🔍" if match_type == "high_similarity" else "🌐"
+                log.info(
+                    f"[KB-v2] ACCEPTED | {icon} {match_type:<16} raw={cosine:.4f} reranked={final:.4f} "
+                    f"(sem={semantic:.2f} cat={cat_b:.2f}) "
+                    f"| cat={category} | q='{q_text[:40]}'"
+                )
 
             candidates.append(KnowledgeMatch(
                 question=q_text, answer=a_text, confidence=final, category=category,

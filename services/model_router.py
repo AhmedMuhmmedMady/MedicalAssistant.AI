@@ -50,20 +50,7 @@ class ModelRouter:
                 if not ENABLE_FALLBACK:
                     return self._fallback_deterministic(query, language)
 
-        # 2. OpenRouter
-        try:
-            log.info("MODEL_ATTEMPT: OpenRouter")
-            response = await self._call_openrouter(prompt, temperature, max_tokens, image_bytes, mime_type)
-            log.info("MODEL_SUCCESS: OpenRouter")
-            return {
-                "status": "fallback",
-                "model_used": "openrouter-fallback",
-                "response": response
-            }
-        except Exception as e:
-            log.error(f"MODEL_FAILED: OpenRouter | {e}")
-
-        # 3. Groq
+        # 2. Groq
         try:
             log.info("MODEL_ATTEMPT: Groq")
             response = await self._call_groq(prompt, temperature, max_tokens, image_bytes, mime_type)
@@ -75,6 +62,19 @@ class ModelRouter:
             }
         except Exception as e:
             log.error(f"MODEL_FAILED: Groq | {e}")
+            
+        # 3. OpenRouter
+        try:
+            log.info("MODEL_ATTEMPT: OpenRouter")
+            response = await self._call_openrouter(prompt, temperature, max_tokens, image_bytes, mime_type)
+            log.info("MODEL_SUCCESS: OpenRouter")
+            return {
+                "status": "fallback",
+                "model_used": "openrouter-fallback",
+                "response": response
+            }
+        except Exception as e:
+            log.error(f"MODEL_FAILED: OpenRouter | {e}")
             
         # 4. Local Model (Rule-based RAG offline fallback)
         try:
@@ -96,6 +96,8 @@ class ModelRouter:
             
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "HTTP-Referer": "https://your-domain.com",
+            "X-Title": "Sila Medical AI",
             "Content-Type": "application/json"
         }
         
@@ -132,17 +134,18 @@ class ModelRouter:
             "Content-Type": "application/json"
         }
         
-        model_name = "llama-3.1-70b-versatile"
-        content = [{"type": "text", "text": prompt}]
+        model_name = "llama-3.3-70b-versatile"
         
         if image_bytes and mime_type:
             import base64
             model_name = "llama-3.2-90b-vision-preview"
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}
-            })
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}}
+            ]
+        else:
+            content = prompt
 
         data = {
             "model": model_name,

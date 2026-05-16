@@ -7,12 +7,19 @@ _NON_WORD_RE = re.compile(r"[^\w\u0600-\u06ff\s]")
 _SPACES_RE = re.compile(r"\s+")
 _ARABIC_TRANS = str.maketrans({'أ':'ا','إ':'ا','آ':'ا','ة':'ه','ى':'ي','ؤ':'و','ئ':'ي'})
 
+def normalize_arabic(text: str) -> str:
+    """Normalize Arabic text."""
+    if not text: return ""
+    text = text.replace("ـ", "") # remove tatweel
+    text = text.translate(_ARABIC_TRANS) # normalize alef, yaa, taa marbota
+    return _SPACES_RE.sub(" ", text).strip()
+
 def normalize_text(text: str) -> str:
     """Unified normalization: lowercase + no punctuation + Arabic unification."""
     if not text: return ""
     t = _DIACRITICS_RE.sub("", text)
-    t = t.translate(_ARABIC_TRANS).lower()
-    t = _NON_WORD_RE.sub(" ", t)
+    t = normalize_arabic(t)
+    t = _NON_WORD_RE.sub(" ", t.lower())
     return _SPACES_RE.sub(" ", t).strip()
 
 NORMALIZED_SYMPTOM_MAP = {

@@ -42,5 +42,7 @@ class AsyncCache:
         except BaseException as exc:
             async with self._lock:
                 self._pending.pop(key, None)
-            if not fut.done(): fut.set_exception(exc)
+            if not fut.done():
+                fut.set_exception(exc)
+                fut.exception()  # Prevent "Task exception was never retrieved" warning
             raise

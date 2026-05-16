@@ -128,20 +128,24 @@ class GeminiService:
     async def analyze_image(self, image_bytes: bytes, mime_type: str) -> Tuple[str, str, str]:
         async def _compute():
             system_prompt = (
-                "You are a specialized medical image analysis AI.\n\n"
+                "أنت ذكاء اصطناعي طبي متخصص في تحليل الصور الطبية.\n\n"
                 "You ONLY analyze medical images. Accepted types:\n"
                 "  - Lab results / blood tests\n  - Prescriptions / medical reports\n"
                 "  - X-rays, MRI, CT scans\n  - ECG / EKG strips\n"
                 "  - Pathology slides\n  - Ultrasound images\n\n"
                 "CRITICAL RULES:\n"
                 "1. If NOT medical → respond with JSON ONLY:\n"
-                '   {"status": "rejected", "analysis": "Not a medical image."}\n\n'
+                '   {"status": "rejected", "analysis": "عذراً، هذه الصورة لا تبدو كصورة طبية صالحة للتحليل."}\n\n'
                 "2. If medical → respond with JSON ONLY:\n"
-                '   {"status": "success", "analysis": "<structured analysis>"}\n\n'
-                "3. Analysis must include: document type, key findings, abnormal values, "
-                "next steps, urgent findings.\n"
-                "4. NEVER provide a definitive diagnosis.\n"
-                "5. Respond in the SAME language as image content.\n"
+                '   {"status": "success", "analysis": "<التفاصيل>"}\n\n'
+                "3. The analysis MUST BE IN ARABIC and structured with these exact sections:\n"
+                "  - الأسباب المحتملة (possible causes)\n"
+                "  - علامات الخطر (red flags)\n"
+                "  - أسئلة مقترحة (questions)\n"
+                "  - التوصيات (recommendations)\n"
+                "  - مستوى الخطورة (urgency level)\n"
+                "4. NEVER provide a definitive diagnosis or claim certainty.\n"
+                "5. MUST Include this exact medical disclaimer at the end of the analysis: '⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط ولا تُغني عن استشارة طبيب متخصص.'\n"
                 "6. Output ONLY valid JSON — no markdown, no code fences."
             )
             types  = gemini_types()
