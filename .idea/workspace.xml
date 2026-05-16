@@ -1,7 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="New Fixes" />
+    <list default="true" id="0c049c04-3c67-4308-901b-cb266294f5c8" name="Changes" comment="New Fixes">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/constants.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/constants.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/gemini_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/gemini_service.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/knowledge_base.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/knowledge_base.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/model_router.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/model_router.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/cache.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/cache.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/text.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/text.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />

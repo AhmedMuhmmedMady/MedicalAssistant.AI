@@ -102,16 +102,18 @@ class ModelRouter:
         }
         
         model_name = "meta-llama/llama-3.1-8b-instruct"
-        content = [{"type": "text", "text": prompt}]
         
         if image_bytes and mime_type:
+            if not prompt: prompt = "قم بتحليل هذه الصورة الطبية واستخراج الأسباب المحتملة، علامات الخطر، والتوصيات بدقة باللغة العربية."
             import base64
-            model_name = "meta-llama/llama-3.2-90b-vision-instruct"
+            model_name = "google/gemini-2.5-flash"
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}
-            })
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}}
+            ]
+        else:
+            content = prompt
 
         data = {
             "model": model_name,
@@ -137,6 +139,7 @@ class ModelRouter:
         model_name = "llama-3.3-70b-versatile"
         
         if image_bytes and mime_type:
+            if not prompt: prompt = "قم بتحليل هذه الصورة الطبية واستخراج الأسباب المحتملة، علامات الخطر، والتوصيات بدقة باللغة العربية."
             import base64
             model_name = "llama-3.2-90b-vision-preview"
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
