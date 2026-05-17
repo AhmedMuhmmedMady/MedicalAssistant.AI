@@ -93,29 +93,26 @@ class ModelRouter:
         except Exception as e:
             log.error(f"MODEL_FAILED: Groq | {e}")
             
-        # 3. OpenRouter
+        # 4. OpenRouter Fallback Pool
         try:
-            log.info("MODEL_ATTEMPT: OpenRouter")
-            model_name = "google/gemini-2.5-flash" if (image_bytes and mime_type) else "meta-llama/llama-3.1-8b-instruct"
-            extra_headers = {"HTTP-Referer": "https://your-domain.com", "X-Title": "Mady Medical AI"}
-            response = await self._call_openai_compatible(
-                base_url="https://openrouter.ai/api/v1/chat/completions",
-                api_key=OPENROUTER_API_KEY,
-                model_name=model_name,
-                prompt=prompt, temperature=temperature, max_tokens=max_tokens,
-                image_bytes=image_bytes, mime_type=mime_type,
-                extra_headers=extra_headers
+            log.info("MODEL_ATTEMPT: OpenRouter Fallback Pool")
+            response, friendly_name = await self._call_openrouter_fallback(
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                image_bytes=image_bytes,
+                mime_type=mime_type
             )
-            log.info("MODEL_SUCCESS: OpenRouter")
+            log.info(f"MODEL_SUCCESS: OpenRouter Fallback Pool ({friendly_name})")
             return {
                 "status": "fallback",
-                "model_used": "openrouter-fallback",
+                "model_used": friendly_name,
                 "response": response
             }
         except Exception as e:
-            log.error(f"MODEL_FAILED: OpenRouter | {e}")
+            log.error(f"MODEL_FAILED: OpenRouter Fallback Pool | {e}")
             
-        # 4. Local Model (Rule-based RAG offline fallback)
+        # 5. Local Model (Rule-based RAG offline fallback)
         try:
             log.info("MODEL_ATTEMPT: LocalDeterministic")
             res = self._fallback_deterministic(query, language)
@@ -177,6 +174,71 @@ class ModelRouter:
                 log.error(f"MODEL_FAILED: GitHub Model {name} ({model}) | {e}")
                 
         raise RuntimeError("All GitHub Models fallback options exhausted.")
+
+    async def _call_openrouter_fallback(
+        self, prompt: str, temperature: float, max_tokens: int,
+        image_bytes: bytes = None, mime_type: str = None
+    ) -> Tuple[str, str]:
+        """
+        Fallback layer that rotates through curated, free OpenRouter models
+        ordered from strongest/largest to weakest/most efficient.
+        """
+        if not OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY is not set.")
+
+        # If vision is requested, use Gemini 2.5 Flash on OpenRouter
+        if image_bytes and mime_type:
+            vision_model = "google/gemini-2.5-flash"
+            log.info(f"MODEL_ATTEMPT: OpenRouter Vision ({vision_model})")
+            reply = await self._call_openai_compatible(
+                base_url="https://openrouter.ai/api/v1/chat/completions",
+                api_key=OPENROUTER_API_KEY,
+                model_name=vision_model,
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                extra_headers={"HTTP-Referer": "https://your-domain.com", "X-Title": "Mady Medical AI"}
+            )
+            return reply, f"openrouter-{vision_model}"
+
+        # Otherwise, iterate through text models from strongest to weakest
+        openrouter_models = [
+            ("nousresearch/hermes-3-llama-3.1-405b:free", "Hermes-3-Llama-3.1-405B"),
+            ("openai/gpt-oss-120b:free", "GPT-OSS-120B"),
+            ("meta-llama/llama-3.3-70b-instruct:free", "Llama-3.3-70B-Instruct"),
+            ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "Nemotron-3-Nano-Omni-30B"),
+            ("openai/gpt-oss-20b:free", "GPT-OSS-20B"),
+            ("poolside/laguna-m.1:free", "Laguna-M.1"),
+            ("openrouter/owl-alpha", "Owl-Alpha"),
+            ("meta-llama/llama-3.2-3b-instruct:free", "Llama-3.2-3B-Instruct"),
+            ("poolside/laguna-xs.2:free", "Laguna-XS.2"),
+            ("baidu/cobuddy:free", "CoBuddy")
+        ]
+
+        extra_headers = {"HTTP-Referer": "https://your-domain.com", "X-Title": "Mady Medical AI"}
+
+        for model_id, friendly_name in openrouter_models:
+            try:
+                log.info(f"MODEL_ATTEMPT: OpenRouter Fallback Pool ({friendly_name})")
+                reply = await self._call_openai_compatible(
+                    base_url="https://openrouter.ai/api/v1/chat/completions",
+                    api_key=OPENROUTER_API_KEY,
+                    model_name=model_id,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    image_bytes=image_bytes,
+                    mime_type=mime_type,
+                    extra_headers=extra_headers
+                )
+                log.info(f"MODEL_SUCCESS: OpenRouter Fallback Pool ({friendly_name})")
+                return reply, f"openrouter-{friendly_name}"
+            except Exception as e:
+                log.error(f"MODEL_FAILED: OpenRouter Fallback Pool ({friendly_name}) | {e}")
+
+        raise RuntimeError("All OpenRouter Fallback Pool models exhausted.")
 
     async def _call_openai_compatible(
         self, base_url: str, api_key: str, model_name: str, 
