@@ -32,11 +32,25 @@ class PromptBuilder:
     }
 
     def _build_context_block(self, matches: List[KnowledgeMatch], language: str) -> str:
-        parts = []
-        for i, m in enumerate(matches, 1):
-            rel = ("✅ موثوق" if m.is_reliable else "⚠️ ثقة منخفضة") if language == "ar" else ("✅ Reliable" if m.is_reliable else "⚠️ Low conf")
-            parts.append(f"[{i}] {rel} — Score: {m.confidence:.0%}\n[Specialty: {m.category or 'General'}]\nQ: {m.question}\nA: {m.answer}")
-        return f"\n\n{self._SEP}\n".join(parts)
+        if language == "ar":
+            blocks = []
+            for m in matches:
+                # Filter out raw matches that are fallback texts to prevent confusing the model
+                if "لا توجد معلومات طبية كافية" in m.answer:
+                    continue
+                block = (
+                    f"📍 [التخصص: {m.category or 'عام'}]\n\n"
+                    f"سؤال مشابه:\n{m.question.strip()}\n\n"
+                    f"الإجابة الطبية:\n{m.answer.strip()}"
+                )
+                blocks.append(block)
+            return f"\n\n{self._SEP}\n\n".join(blocks)
+        else:
+            parts = []
+            for i, m in enumerate(matches, 1):
+                rel = "✅ Reliable" if m.is_reliable else "⚠️ Low conf"
+                parts.append(f"[{i}] {rel} — Score: {m.confidence:.0%}\n[Specialty: {m.category or 'General'}]\nQ: {m.question}\nA: {m.answer}")
+            return f"\n\n{self._SEP}\n".join(parts)
 
     def _prompt(self, system: str, context_label: Optional[str], context: Optional[str], query: str, structure: str, lang: str) -> str:
         q_label = "🧑‍⚕️ سؤال المريض:" if lang == "ar" else "🧑‍⚕️ Patient Question:"

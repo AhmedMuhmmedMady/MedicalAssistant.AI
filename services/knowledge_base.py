@@ -71,52 +71,16 @@ class KnowledgeBaseService:
     def __init__(self):
         from utils.cache import AsyncCache
         self._async_cache = AsyncCache(200)
+        self.engine = None
 
     async def search(self, query: str, top_k: int = TOP_K) -> List[KnowledgeMatch]:
-        cache_key = f"{top_k}_{query}"
-        
-        async def _compute_search():
-            log.info(f"[KB-v2] Searching: '{query[:80]}'")
-            expected_cats = _extract_expected_categories(query)
-            log.info(f"[KB-v2] Expected categories: {expected_cats or ['unknown']}")
+        if self.engine is None:
+            from services.gemini_service import GeminiService
+            from rag.retrieval_engine import ArabicMedicalRetrievalEngine
+            self.engine = ArabicMedicalRetrievalEngine(gemini_service=GeminiService())
+            
+        return await self.engine.retrieve(query, top_k=top_k)
 
-            try:
-                vector = await encode_async(query)
-            except Exception as exc:
-                log.error(f"[KB-v2] Encoding failed: {exc}")
-                return []
-
-            index   = await get_index()
-            fetch_k = min(top_k * 3, 30)
-
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    def _call():
-                        return index.query(
-                            vector=vector, top_k=fetch_k,
-                            include_metadata=True, namespace=PINECONE_NAMESPACE or ""
-                        )
-                    results = await asyncio.wait_for(asyncio.to_thread(_call), timeout=10.0)
-
-                    raw_scores = [round(float(m.score), 4) for m in results.matches if m.score]
-                    log.info(f"[KB-v2] Pinecone raw scores ({len(raw_scores)}): {raw_scores}")
-
-                    res = self._parse_matches_hybrid(results, query, expected_cats, fetch_k)
-                    res = self._deduplicate_and_sanitize(res)
-                    return res[:top_k]
-
-                except Exception as exc:
-                    log.warning(f"[KB-v2] Attempt {attempt}/{MAX_RETRIES} failed: {exc}")
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(RETRY_DELAY * attempt)
-
-            log.error("[KB-v2] All retries exhausted")
-            return []
-
-        res, is_hit = await self._async_cache.get_or_compute(cache_key, _compute_search)
-        if is_hit:
-            log.info(f"[KB-v2] Cache hit for '{query[:30]}'")
-        return res
 
     @staticmethod
     def _parse_matches_hybrid(
