@@ -6,3 +6,5 @@ MedQuAD/
 __pycache__/
 Test.xlsx
 Cleaned_Test.xlsx
+.env
+scratch/

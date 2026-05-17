@@ -1,6 +1,9 @@
 import httpx
 from typing import Dict, Any, Tuple
-from core.config import OPENROUTER_API_KEY, GROQ_API_KEY, PRIMARY_MODEL, ENABLE_FALLBACK
+from core.config import (
+    OPENROUTER_API_KEY, GROQ_API_KEY, PRIMARY_MODEL, ENABLE_FALLBACK,
+    GITHUB_TOKEN_PHI4, GITHUB_TOKEN_GPT4_MINI, GITHUB_TOKEN_GPT4, GITHUB_TOKEN_GROK3, GITHUB_TOKEN_GPT5
+)
 from core.logging import log
 from services.gemini_service import GeminiService
 from engine.decision_engine import generate_deterministic_fallback
@@ -50,7 +53,27 @@ class ModelRouter:
                 if not ENABLE_FALLBACK:
                     return self._fallback_deterministic(query, language)
 
-        # 2. Groq
+        # 2. GitHub Models Fallback (Premium HA Rotating Layer)
+        if ENABLE_FALLBACK:
+            try:
+                log.info("MODEL_ATTEMPT: GitHub Models Fallback Pool")
+                response, friendly_name = await self._call_github_fallback(
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    image_bytes=image_bytes,
+                    mime_type=mime_type
+                )
+                log.info(f"MODEL_SUCCESS: GitHub Models Fallback Pool ({friendly_name})")
+                return {
+                    "status": "fallback",
+                    "model_used": friendly_name,
+                    "response": response
+                }
+            except Exception as e:
+                log.error(f"MODEL_FAILED: GitHub Models Fallback Pool | {e}")
+
+        # 3. Groq
         try:
             log.info("MODEL_ATTEMPT: Groq")
             model_name = "llama-3.2-90b-vision-preview" if (image_bytes and mime_type) else "llama-3.3-70b-versatile"
@@ -105,6 +128,55 @@ class ModelRouter:
                 "model_used": "deterministic-safeguard",
                 "response": "عذراً، أواجه مشكلة تقنية. يرجى استشارة طبيب متخصص." if language == "ar" else "Sorry, I am facing a technical issue. Please consult a medical professional."
             }
+
+    async def _call_github_fallback(
+        self, prompt: str, temperature: float, max_tokens: int,
+        image_bytes: bytes = None, mime_type: str = None
+    ) -> Tuple[str, str]:
+        """
+        Premium fallback layer that rotates through high-availability GitHub Models tokens
+        to execute GPT-4o, GPT-4o-mini, or Phi-4 clinical reasoning.
+        """
+        github_endpoints = []
+        
+        # Build candidate list with tokens, models, and metadata
+        if GITHUB_TOKEN_GPT4:
+            github_endpoints.append((GITHUB_TOKEN_GPT4, "gpt-4o", "github-gpt-4.1"))
+        if GITHUB_TOKEN_GROK3:
+            github_endpoints.append((GITHUB_TOKEN_GROK3, "gpt-4o", "github-grok-3"))
+        if GITHUB_TOKEN_GPT5:
+            github_endpoints.append((GITHUB_TOKEN_GPT5, "gpt-4o", "github-gpt-5"))
+        if GITHUB_TOKEN_GPT4_MINI:
+            github_endpoints.append((GITHUB_TOKEN_GPT4_MINI, "gpt-4o-mini", "github-gpt-4.1-mini"))
+        if GITHUB_TOKEN_PHI4:
+            github_endpoints.append((GITHUB_TOKEN_PHI4, "Phi-4", "github-phi-4"))
+            
+        base_url = "https://models.github.ai/inference/chat/completions"
+        
+        for token, model, name in github_endpoints:
+            # Phi-4 does not support vision
+            if image_bytes and model == "Phi-4":
+                log.warning(f"[Model Router] Skipping GitHub model {name} ({model}) for image input since Phi-4 does not support vision.")
+                continue
+                
+            try:
+                log.info(f"MODEL_ATTEMPT: GitHub Model {name} ({model})")
+                reply = await self._call_openai_compatible(
+                    base_url=base_url,
+                    api_key=token,
+                    model_name=model,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    image_bytes=image_bytes,
+                    mime_type=mime_type
+                )
+                log.info(f"MODEL_SUCCESS: GitHub Model {name} ({model})")
+                return reply, name
+            except Exception as e:
+                log.error(f"MODEL_FAILED: GitHub Model {name} ({model}) | {e}")
+                
+        raise RuntimeError("All GitHub Models fallback options exhausted.")
 
     async def _call_openai_compatible(
         self, base_url: str, api_key: str, model_name: str, 

@@ -8,6 +8,14 @@ GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+
+# GitHub Models Fallback Tokens (provided by user)
+GITHUB_TOKEN_PHI4      = os.getenv("GITHUB_TOKEN_PHI4", "")
+GITHUB_TOKEN_GPT4_MINI = os.getenv("GITHUB_TOKEN_GPT4_MINI", "")
+GITHUB_TOKEN_GPT4      = os.getenv("GITHUB_TOKEN_GPT4", "")
+GITHUB_TOKEN_GROK3     = os.getenv("GITHUB_TOKEN_GROK3", "")
+GITHUB_TOKEN_GPT5      = os.getenv("GITHUB_TOKEN_GPT5", "")
+
 PRIMARY_MODEL      = os.getenv("PRIMARY_MODEL", "gemini")
 ENABLE_FALLBACK    = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
 
