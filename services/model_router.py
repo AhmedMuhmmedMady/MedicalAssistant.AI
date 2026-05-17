@@ -54,7 +54,8 @@ class ModelRouter:
                     return self._fallback_deterministic(query, language)
 
         # 2. GitHub Models Fallback (Premium HA Rotating Layer)
-        if ENABLE_FALLBACK:
+        # Skip this fallback completely for images since GitHub Models do not support base64 uploads
+        if ENABLE_FALLBACK and not image_bytes:
             try:
                 log.info("MODEL_ATTEMPT: GitHub Models Fallback Pool")
                 response, friendly_name = await self._call_github_fallback(
@@ -257,7 +258,19 @@ class ModelRouter:
             headers.update(extra_headers)
             
         if image_bytes and mime_type:
-            if not prompt: prompt = "قم بتحليل هذه الصورة الطبية واستخراج الأسباب المحتملة، علامات الخطر، والتوصيات بدقة باللغة العربية."
+            if not prompt or prompt == "Medical image analysis" or len(prompt) < 30:
+                prompt = (
+                    "أنت ذكاء اصطناعي طبي استشاري متخصص في تحليل الصور والتقارير الطبية والتحاليل.\n"
+                    "قم بتحليل هذه الصورة الطبية بدقة باللغة العربية واستخراج تقرير منظم يحتوي على الأقسام التالية:\n"
+                    "1. الأسباب المحتملة (Possible Causes)\n"
+                    "2. علامات الخطر (Red Flags)\n"
+                    "3. أسئلة مقترحة للمريض (Suggested Questions)\n"
+                    "4. التوصيات والإرشادات (Recommendations)\n"
+                    "5. مستوى الخطورة (Urgency Level)\n\n"
+                    "قوانين هامة:\n"
+                    "- لا تقدم تشخيصاً جازماً أو تدعي اليقين.\n"
+                    "- يجب إرفاق هذا التنبيه القانوني حرفياً في نهاية رسالتك: '⚠️ تنبيه: هذه المعلومات للتوجيه العام فقط ولا تُغني عن استشارة طبيب متخصص.'"
+                )
             import base64
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
             content = [
