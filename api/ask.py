@@ -147,7 +147,7 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
     try:
         if rag_mode == "EMERGENCY_OVERRIDE":
             try:
-                res = await model_router.generate({"prompt": prompt_builder.build_emergency(q, lang), "query": q, "language": lang})
+                res = await model_router.generate({"prompt": prompt_builder.build_emergency(q, lang, req.history), "query": q, "language": lang})
                 reply, model = res["response"], res["model_used"]
                 log.info(f"[Model] ✅ Emergency response via {model}")
             except Exception as exc:
@@ -156,17 +156,17 @@ async def _ask_inner(req: AskRequest, request: Request) -> AskResponse:
             return _build_resp(reply, model, False, False)
 
         elif rag_mode == "RAG_STRONG":
-            ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+            ctx = QueryContext(raw_query=q, language=lang, matches=selected, history=req.history)
             res = await model_router.generate({"prompt": prompt_builder.build(ctx), "query": q, "language": lang})
             return _build_resp(res["response"], res["model_used"], True, False)
 
         elif rag_mode == "RAG_LIGHT":
-            ctx = QueryContext(raw_query=q, language=lang, matches=selected)
+            ctx = QueryContext(raw_query=q, language=lang, matches=selected, history=req.history)
             res = await model_router.generate({"prompt": prompt_builder.build_rag_light(ctx), "query": q, "language": lang})
             return _build_resp(res["response"], res["model_used"], True, True)
 
         else: # GEMINI_ONLY
-            res = await model_router.generate({"prompt": prompt_builder.build_gemini_only(q, lang), "query": q, "language": lang})
+            res = await model_router.generate({"prompt": prompt_builder.build_gemini_only(q, lang, req.history), "query": q, "language": lang})
             return _build_resp(res["response"], res["model_used"], False, True)
 
     except Exception as exc:

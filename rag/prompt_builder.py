@@ -52,15 +52,40 @@ class PromptBuilder:
                 parts.append(f"[{i}] {rel} — Score: {m.confidence:.0%}\n[Specialty: {m.category or 'General'}]\nQ: {m.question}\nA: {m.answer}")
             return f"\n\n{self._SEP}\n".join(parts)
 
-    def _prompt(self, system: str, context_label: Optional[str], context: Optional[str], query: str, structure: str, lang: str) -> str:
-        q_label = "🧑‍⚕️ سؤال المريض:" if lang == "ar" else "🧑‍⚕️ Patient Question:"
-        a_label = "الإجابة:" if lang == "ar" else "Answer:"
+    def _prompt(self, system: str, context_label: Optional[str], context: Optional[str], query: str, structure: str, lang: str, history: Optional[List] = None) -> str:
+        q_label = "🧑‍⚕️ سؤال المريض الحالي:" if lang == "ar" else "🧑‍⚕️ Current Patient Question:"
         
         parts = [system, self._SEP]
+        
+        # Format and inject conversation history if provided
+        if history:
+            h_label = "💬 سياق المحادثة السابقة (History):" if lang == "ar" else "💬 Previous Conversation Context (History):"
+            h_blocks = []
+            for msg in history:
+                role_lbl = "المريض" if msg.role == "user" else "ماضي"
+                if lang != "ar":
+                    role_lbl = "Patient" if msg.role == "user" else "Mady"
+                h_blocks.append(f"{role_lbl}: {msg.content}")
+            
+            parts.extend([h_label, "", "\n".join(h_blocks), "", self._SEP])
+            
         if context_label and context:
             parts.extend([context_label, "", context, "", self._SEP])
         
-        parts.extend([q_label, query, "", structure, "", a_label])
+        parts.extend([q_label, query, "", structure])
+        
+        # If it's a structured response (contains ### markdown headings), guide the model explicitly to start there
+        if "###" in structure:
+            guidance = (
+                "\nأجب الآن بالالتزام التام بالهيكلة المحددة أعلاه وابدأ بـ '### تحليل الاستعلام:':"
+                if lang == "ar" else
+                "\nPlease respond strictly in the requested structure, beginning with '### Analyzed Query:':"
+            )
+            parts.append(guidance)
+        else:
+            a_label = "الإجابة:" if lang == "ar" else "Answer:"
+            parts.append(a_label)
+            
         return "\n".join(parts)
 
     def build(self, ctx: QueryContext) -> str:
@@ -71,7 +96,8 @@ class PromptBuilder:
             self._build_context_block(ctx.matches, lang),
             ctx.raw_query,
             self._PROMPTS["structure"][lang],
-            lang
+            lang,
+            ctx.history
         )
 
     def build_rag_light(self, ctx: QueryContext) -> str:
@@ -82,29 +108,33 @@ class PromptBuilder:
             self._build_context_block(ctx.matches, lang),
             ctx.raw_query,
             self._PROMPTS["structure"][lang],
-            lang
+            lang,
+            ctx.history
         )
 
-    def build_emergency(self, query: str, language: str) -> str:
+    def build_emergency(self, query: str, language: str, history: Optional[List] = None) -> str:
         return self._prompt(
             self._PROMPTS["emergency"][language],
             None, None, query,
             self._PROMPTS["structure"][language],
-            language
+            language,
+            history
         )
 
-    def build_gemini_only(self, query: str, language: str) -> str:
+    def build_gemini_only(self, query: str, language: str, history: Optional[List] = None) -> str:
         return self._prompt(
             self._PROMPTS["gemini_only"][language],
             None, None, query,
             self._PROMPTS["structure"][language],
-            language
+            language,
+            history
         )
 
-    def build_non_medical(self, query: str, language: str) -> str:
+    def build_non_medical(self, query: str, language: str, history: Optional[List] = None) -> str:
         return self._prompt(
             self._PROMPTS["non_medical"].get(language, self._PROMPTS["non_medical"]["ar"]),
             None, None, query,
             "الرجاء الرد بفقرة واحدة ودودة ولطيفة جداً." if language == "ar" else "Please respond in a single friendly paragraph.",
-            language
+            language,
+            history
         )

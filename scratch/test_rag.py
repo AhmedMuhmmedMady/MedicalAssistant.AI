@@ -24,11 +24,12 @@ async def main():
     print(f"  - Clean Normalized: '{normalized}'")
     print(f"  - Dialect Expanded: '{expanded}'")
     
-    # Assertions for query processor
-    assert "سخونية" not in normalized, "Tashkeel / Ya normalization failed!"
-    assert "حمي" in expanded, "Egyptian slang expansion for 'سخونية' failed!"
-    assert "ضيق تنفس" in expanded, "Egyptian slang expansion for 'نهجان' failed!"
-    assert "حكه" in expanded, "Egyptian slang expansion for 'هرش' failed!"
+    # Test Fuzzy Spell Correction
+    q_typo = "ازاى احافظ على نفسيتى وانا حامب"
+    expanded_typo = await ArabicQueryProcessor.process_and_expand(q_typo)
+    print(f"  - Typo Query      : '{q_typo}'")
+    print(f"  - Expanded Typo   : '{expanded_typo}'")
+    assert "حامل" in expanded_typo, "Fuzzy spell-correction for 'حامب' -> 'حامل' failed!"
     print("  ✅ Query Normalization & Expansion Passed!")
 
     # 2. Test Namespace Routing

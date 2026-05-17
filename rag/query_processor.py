@@ -58,6 +58,66 @@ class ArabicQueryProcessor:
         'ئ': 'ي', 'ـ': ''
     })
 
+    _COMMON_MEDICAL_WORDS = {
+        "حامل", "حمل", "صداع", "سخونه", "سخونة", "مغص", "ترجيع", "اسهال",
+        "كحه", "كحة", "نهجان", "وجع", "الم", "ألم", "هرش", "حكه", "حكة", "تنفس",
+        "صدر", "بطن", "قلب", "ضغط", "سكر", "دوار", "دوخه", "دوخة", "حراره", "حرارة"
+    }
+
+    @staticmethod
+    def levenshtein_distance(s1: str, s2: str) -> int:
+        if len(s1) < len(s2):
+            return ArabicQueryProcessor.levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+            
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+            
+        return previous_row[-1]
+
+    @classmethod
+    def correct_spelling(cls, query: str) -> str:
+        """
+        Applies a fuzzy Levenshtein spell-correction to common medical words
+        to handle typological keyboard slips (e.g., 'حامب' -> 'حامل').
+        """
+        words = query.split()
+        corrected_words = []
+        
+        for word in words:
+            # If the word is already a known medical slang or in dictionary, keep it
+            if word in EGYPTIAN_DIALECT_MAP or word in cls._COMMON_MEDICAL_WORDS or len(word) <= 2:
+                corrected_words.append(word)
+                continue
+            
+            best_match = word
+            best_dist = 999
+            
+            for target in cls._COMMON_MEDICAL_WORDS:
+                # Only check words of similar length to prevent wild corrections
+                if abs(len(word) - len(target)) <= 1:
+                    dist = cls.levenshtein_distance(word, target)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_match = target
+            
+            # If we found a very close match (distance of exactly 1), correct it!
+            if best_dist == 1:
+                log.info(f"[Query Processor] ⚡ Fuzzy Spell Corrected: '{word}' -> '{best_match}'")
+                corrected_words.append(best_match)
+            else:
+                corrected_words.append(word)
+                
+        return " ".join(corrected_words)
+
     @classmethod
     def clean_and_normalize(cls, text: str) -> str:
         """
@@ -151,6 +211,9 @@ class ArabicQueryProcessor:
         """
         # 1. Base Normalization
         normalized_query = cls.clean_and_normalize(query)
+        
+        # 1.5 Fuzzy Spelling Correction for Arabic keyboard slips (e.g. 'حامب' -> 'حامل')
+        normalized_query = cls.correct_spelling(normalized_query)
         
         # 2. Local Slang Mapping (Egyptian Dialect)
         dialect_synonyms = cls.expand_dialect_egyptian(normalized_query)

@@ -77,6 +77,7 @@ class QueryContext:
     raw_query: str
     language: str
     matches: List[KnowledgeMatch] = field(default_factory=list)
+    history: Optional[List[MessageDto]] = None
 
     @property
     def has_reliable_matches(self) -> bool:
